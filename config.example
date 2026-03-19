@@ -1,0 +1,38 @@
+# media-cli configuration
+# Copy to ~/.config/media-cli/config and fill in your values
+# Or run `media setup` for interactive configuration
+
+# Connection: "local" or "ssh:hostname"
+# Use "local" if services run on this machine
+# Use "ssh:myserver" to run commands over SSH (services bind to localhost on remote)
+MEDIA_HOST="local"
+MEDIA_HOST_OS="linux"  # "linux" or "windows"
+
+# Core services (required)
+SONARR_URL="http://localhost:8989"
+SONARR_KEY="your-sonarr-api-key"
+
+RADARR_URL="http://localhost:7878"
+RADARR_KEY="your-radarr-api-key"
+
+PROWLARR_URL="http://localhost:9696"
+PROWLARR_KEY="your-prowlarr-api-key"
+
+QBIT_URL="http://localhost:8080"
+QBIT_USER="admin"
+QBIT_PASS="adminadmin"
+
+# Optional services (leave key empty to disable)
+BAZARR_URL="http://localhost:6767"
+BAZARR_KEY=""
+
+JELLYSEERR_URL="http://localhost:5055"
+JELLYSEERR_KEY=""
+
+FLARESOLVERR_URL="http://localhost:8191"
+
+# Defaults
+DEFAULT_MOVIE_QUALITY=4        # Quality profile ID (4 = HD-1080p typically)
+DEFAULT_SHOW_QUALITY=4
+DEFAULT_MOVIE_ROOT="/movies"   # Root folder path for new movies
+DEFAULT_SHOW_ROOT="/tv"        # Root folder path for new shows

@@ -1,0 +1,760 @@
+#!/usr/bin/env bash
+# media-cli - CLI wrapper for the *arr media stack
+# https://github.com/solomonneas/media-cli
+#
+# Manages Sonarr, Radarr, Prowlarr, qBittorrent, Bazarr, Jellyseerr,
+# and companion services via SSH or locally.
+#
+# Configuration: ~/.config/media-cli/config
+# Run `media setup` to generate a config interactively.
+
+set -euo pipefail
+
+# ── Config Loading ──────────────────────────────────────────────────────────
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/media-cli"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+_load_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "Error: No config found at $CONFIG_FILE"
+        echo "Run 'media setup' to create one, or copy the example config."
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+}
+
+# ── Connection Mode ─────────────────────────────────────────────────────────
+# Supports two modes:
+#   MEDIA_HOST="ssh:hostname"  - Run curl commands over SSH (services on remote host)
+#   MEDIA_HOST="local"         - Run curl commands locally (services on this machine)
+
+_curl() {
+    local url="$1"; shift
+    local extra="${*:-}"
+    if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+        local host="${MEDIA_HOST#ssh:}"
+        ssh "$host" "curl -sf --max-time 15 $extra \"$url\"" 2>/dev/null
+    else
+        curl -sf --max-time 15 $extra "$url" 2>/dev/null
+    fi
+}
+
+_curl_post() {
+    local url="$1"
+    local data="$2"
+    if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+        local host="${MEDIA_HOST#ssh:}"
+        local b64
+        b64=$(echo "$data" | base64 -w0)
+        # Use PowerShell on Windows SSH hosts, curl on Linux
+        if [ "${MEDIA_HOST_OS:-linux}" = "windows" ]; then
+            ssh "$host" "powershell -Command \"Invoke-RestMethod -Uri '$url' -Method Post -Headers @{'X-Api-Key'='${3:-}';'Content-Type'='application/json'} -Body ([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$b64')))\"" 2>/dev/null
+        else
+            ssh "$host" "echo '$data' | curl -sf --max-time 15 -X POST -H 'Content-Type: application/json' -H 'X-Api-Key: ${3:-}' -d @- '$url'" 2>/dev/null
+        fi
+    else
+        echo "$data" | curl -sf --max-time 15 -X POST -H "Content-Type: application/json" -H "X-Api-Key: ${3:-}" -d @- "$url" 2>/dev/null
+    fi
+}
+
+_powershell() {
+    if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+        local host="${MEDIA_HOST#ssh:}"
+        ssh "$host" "powershell -Command \"$1\"" 2>/dev/null
+    else
+        powershell -Command "$1" 2>/dev/null
+    fi
+}
+
+# ── API Helpers ─────────────────────────────────────────────────────────────
+
+_sonarr() {
+    local endpoint="$1"; shift
+    _curl "${SONARR_URL}/api/v3/$endpoint" "-H \"X-Api-Key: $SONARR_KEY\"" "$@"
+}
+
+_radarr() {
+    local endpoint="$1"; shift
+    _curl "${RADARR_URL}/api/v3/$endpoint" "-H \"X-Api-Key: $RADARR_KEY\"" "$@"
+}
+
+_prowlarr() {
+    local endpoint="$1"; shift
+    _curl "${PROWLARR_URL}/api/v1/$endpoint" "-H \"X-Api-Key: $PROWLARR_KEY\"" "$@"
+}
+
+_bazarr() {
+    local endpoint="$1"; shift
+    _curl "${BAZARR_URL}/api/$endpoint" "-H \"X-Api-Key: $BAZARR_KEY\"" "$@"
+}
+
+_jellyseerr() {
+    local endpoint="$1"; shift
+    _curl "${JELLYSEERR_URL}/api/v1/$endpoint" "-H \"X-Api-Key: $JELLYSEERR_KEY\"" "$@"
+}
+
+_qbit_login() {
+    local sid
+    if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+        local host="${MEDIA_HOST#ssh:}"
+        sid=$(ssh "$host" "curl -sf --max-time 10 -c - \"$QBIT_URL/api/v2/auth/login\" -d \"username=$QBIT_USER&password=$QBIT_PASS\"" 2>/dev/null | grep -oP 'SID\t\K.*')
+    else
+        sid=$(curl -sf --max-time 10 -c - "$QBIT_URL/api/v2/auth/login" -d "username=$QBIT_USER&password=$QBIT_PASS" 2>/dev/null | grep -oP 'SID\t\K.*')
+    fi
+    echo "$sid"
+}
+
+_qbit() {
+    local endpoint="$1"; shift
+    local extra="${*:-}"
+    local sid
+    sid=$(_qbit_login)
+    if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+        local host="${MEDIA_HOST#ssh:}"
+        ssh "$host" "curl -sf --max-time 15 -b \"SID=$sid\" \"$QBIT_URL/api/v2/$endpoint\" $extra" 2>/dev/null
+    else
+        curl -sf --max-time 15 -b "SID=$sid" "$QBIT_URL/api/v2/$endpoint" $extra 2>/dev/null
+    fi
+}
+
+# ── Setup ───────────────────────────────────────────────────────────────────
+
+cmd_setup() {
+    echo "=== media-cli Setup ==="
+    echo ""
+    mkdir -p "$CONFIG_DIR"
+
+    echo "Connection mode:"
+    echo "  1) Local   - services run on this machine"
+    echo "  2) SSH     - services run on a remote host"
+    read -rp "Choice [1]: " mode_choice
+    mode_choice="${mode_choice:-1}"
+
+    local media_host="local"
+    local media_host_os="linux"
+    if [ "$mode_choice" = "2" ]; then
+        read -rp "SSH host (alias or user@host): " ssh_host
+        media_host="ssh:$ssh_host"
+        read -rp "Remote OS (linux/windows) [linux]: " ros
+        media_host_os="${ros:-linux}"
+    fi
+
+    echo ""
+    echo "Enter API URLs and keys (press Enter to skip optional services):"
+    echo ""
+
+    read -rp "Sonarr URL [http://localhost:8989]: " sonarr_url
+    sonarr_url="${sonarr_url:-http://localhost:8989}"
+    read -rp "Sonarr API Key: " sonarr_key
+
+    read -rp "Radarr URL [http://localhost:7878]: " radarr_url
+    radarr_url="${radarr_url:-http://localhost:7878}"
+    read -rp "Radarr API Key: " radarr_key
+
+    read -rp "Prowlarr URL [http://localhost:9696]: " prowlarr_url
+    prowlarr_url="${prowlarr_url:-http://localhost:9696}"
+    read -rp "Prowlarr API Key: " prowlarr_key
+
+    read -rp "qBittorrent URL [http://localhost:8080]: " qbit_url
+    qbit_url="${qbit_url:-http://localhost:8080}"
+    read -rp "qBittorrent Username [admin]: " qbit_user
+    qbit_user="${qbit_user:-admin}"
+    read -rp "qBittorrent Password [adminadmin]: " qbit_pass
+    qbit_pass="${qbit_pass:-adminadmin}"
+
+    echo ""
+    echo "Optional services (press Enter to skip):"
+    read -rp "Bazarr URL [http://localhost:6767]: " bazarr_url
+    read -rp "Bazarr API Key: " bazarr_key
+    read -rp "Jellyseerr URL [http://localhost:5055]: " jellyseerr_url
+    read -rp "Jellyseerr API Key: " jellyseerr_key
+    read -rp "FlareSolverr URL [http://localhost:8191]: " flaresolverr_url
+
+    echo ""
+    read -rp "Default quality profile ID [4]: " quality_id
+    quality_id="${quality_id:-4}"
+    read -rp "Default movie root folder [/movies]: " movie_root
+    movie_root="${movie_root:-/movies}"
+    read -rp "Default show root folder [/tv]: " show_root
+    show_root="${show_root:-/tv}"
+
+    cat > "$CONFIG_FILE" <<CONF
+# media-cli configuration
+# Generated by 'media setup' on $(date -Iseconds)
+
+# Connection: "local" or "ssh:hostname"
+MEDIA_HOST="$media_host"
+MEDIA_HOST_OS="$media_host_os"
+
+# Core services (required)
+SONARR_URL="${sonarr_url}"
+SONARR_KEY="${sonarr_key}"
+RADARR_URL="${radarr_url}"
+RADARR_KEY="${radarr_key}"
+PROWLARR_URL="${prowlarr_url}"
+PROWLARR_KEY="${prowlarr_key}"
+QBIT_URL="${qbit_url}"
+QBIT_USER="${qbit_user}"
+QBIT_PASS="${qbit_pass}"
+
+# Optional services
+BAZARR_URL="${bazarr_url:-http://localhost:6767}"
+BAZARR_KEY="${bazarr_key:-}"
+JELLYSEERR_URL="${jellyseerr_url:-http://localhost:5055}"
+JELLYSEERR_KEY="${jellyseerr_key:-}"
+FLARESOLVERR_URL="${flaresolverr_url:-http://localhost:8191}"
+
+# Defaults
+DEFAULT_MOVIE_QUALITY=${quality_id}
+DEFAULT_SHOW_QUALITY=${quality_id}
+DEFAULT_MOVIE_ROOT="${movie_root}"
+DEFAULT_SHOW_ROOT="${show_root}"
+CONF
+
+    chmod 600 "$CONFIG_FILE"
+    echo ""
+    echo "✅ Config saved to $CONFIG_FILE"
+    echo "   Run 'media status' to test your connection."
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    echo "=== Media Stack Status ==="
+    echo ""
+
+    local sv rv pv qv
+    sv=$(_sonarr "system/status" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin)[\"version\"]}')" 2>/dev/null) && \
+        echo "✅ Sonarr    $sv" || echo "❌ Sonarr    DOWN"
+    rv=$(_radarr "system/status" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin)[\"version\"]}')" 2>/dev/null) && \
+        echo "✅ Radarr    $rv" || echo "❌ Radarr    DOWN"
+    pv=$(_prowlarr "system/status" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin)[\"version\"]}')" 2>/dev/null) && \
+        echo "✅ Prowlarr  $pv" || echo "❌ Prowlarr  DOWN"
+    qv=$(_qbit "app/version" 2>/dev/null) && \
+        echo "✅ qBit      $qv" || echo "❌ qBit      DOWN"
+
+    # Optional services
+    if [ -n "${BAZARR_KEY:-}" ]; then
+        local bv
+        bv=$(_bazarr "system/status" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'v{d.get(\"data\",d).get(\"bazarr_version\",\"?\")}')" 2>/dev/null) && \
+            echo "✅ Bazarr    $bv" || echo "❌ Bazarr    DOWN"
+    fi
+    if [ -n "${JELLYSEERR_KEY:-}" ]; then
+        local jv
+        jv=$(_jellyseerr "status" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin).get(\"version\",\"?\")}')" 2>/dev/null) && \
+            echo "✅ Jellyseerr $jv" || echo "❌ Jellyseerr DOWN"
+    fi
+
+    echo ""
+    echo "=== Library ==="
+    local mc sc
+    mc=$(_radarr "movie" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null) || mc="?"
+    sc=$(_sonarr "series" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null) || sc="?"
+    echo "  Movies: $mc  |  Shows: $sc"
+
+    echo ""
+    echo "=== Active Downloads ==="
+    _qbit "torrents/info" "-d 'filter=active'" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+if not data:
+    print('  No active downloads')
+else:
+    for t in data[:10]:
+        pct = round(t['progress']*100,1)
+        speed = t.get('dlspeed',0)
+        speed_str = f'{speed/1024/1024:.1f} MB/s' if speed > 0 else 'stalled'
+        print(f'  [{pct:5.1f}%] {t[\"name\"][:60]}  ({speed_str})')
+    if len(data) > 10:
+        print(f'  ... and {len(data)-10} more')
+" 2>/dev/null || echo "  Could not fetch downloads"
+}
+
+cmd_movies() {
+    local subcmd="${1:-list}"; shift 2>/dev/null || true
+    case "$subcmd" in
+        list)
+            _radarr "movie" | python3 -c "
+import sys,json
+movies = sorted(json.load(sys.stdin), key=lambda m: m.get('sortTitle',''))
+for m in movies:
+    status = '✅' if m.get('hasFile') else '⏳'
+    year = m.get('year','?')
+    quality = m.get('movieFile',{}).get('quality',{}).get('quality',{}).get('name','') if m.get('hasFile') else ''
+    print(f'{status} {m[\"title\"]} ({year}) {quality}')
+print(f'\nTotal: {len(movies)} movies')
+" 2>/dev/null
+            ;;
+        search)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media movies search <title>"; return 1; }
+            local eq
+            eq=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$query'''))")
+            _radarr "movie/lookup?term=$eq" | python3 -c "
+import sys,json
+results = json.load(sys.stdin)[:10]
+for r in results:
+    year = r.get('year','?')
+    tmdb = r.get('tmdbId','?')
+    added = '➕' if r.get('id') else ''
+    runtime = r.get('runtime',0)
+    print(f'{added} [{tmdb}] {r[\"title\"]} ({year}) {runtime}min')
+    if r.get('overview'):
+        print(f'    {r[\"overview\"][:120]}...')
+if not results: print('No results found.')
+" 2>/dev/null
+            ;;
+        add)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media movies add <title>"; return 1; }
+            local eq
+            eq=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$query'''))")
+            local lookup payload
+            lookup=$(_radarr "movie/lookup?term=$eq")
+            payload=$(echo "$lookup" | python3 -c "
+import sys,json
+results = json.load(sys.stdin)
+if not results: print('ERROR:No results found'); sys.exit(1)
+r = results[0]
+if r.get('id'): print(f'EXISTING:{r[\"title\"]} ({r.get(\"year\",\"?\")}) already in library'); sys.exit(0)
+movie = {'title':r['title'],'qualityProfileId':${DEFAULT_MOVIE_QUALITY},'tmdbId':r['tmdbId'],
+    'titleSlug':r.get('titleSlug',''),'images':r.get('images',[]),'year':r.get('year',0),
+    'rootFolderPath':'${DEFAULT_MOVIE_ROOT}','monitored':True,'addOptions':{'searchForMovie':True}}
+print('ADD:'+json.dumps(movie))
+" 2>/dev/null)
+            case "$payload" in
+                ERROR:*) echo "${payload#ERROR:}"; return 1 ;;
+                EXISTING:*) echo "${payload#EXISTING:}" ;;
+                ADD:*)
+                    local json_data="${payload#ADD:}"
+                    _curl_post "${RADARR_URL}/api/v3/movie" "$json_data" "$RADARR_KEY" | python3 -c "
+import sys,json
+r = json.load(sys.stdin)
+print(f'✅ Added: {r[\"title\"]} ({r.get(\"year\",\"?\")}) - Searching for downloads...')
+" 2>/dev/null || echo "✅ Added movie - searching for downloads..."
+                    ;;
+            esac
+            ;;
+        remove)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media movies remove <title>"; return 1; }
+            _radarr "movie" | python3 -c "
+import sys,json
+query = '''$query'''.lower()
+movies = [m for m in json.load(sys.stdin) if query in m['title'].lower()]
+if not movies: print('ERROR:No match'); sys.exit(1)
+if len(movies) > 1:
+    for m in movies: print(f'MULTI:{m[\"id\"]}: {m[\"title\"]} ({m.get(\"year\",\"?\")})')
+else: print(f'REMOVE:{movies[0][\"id\"]}:{movies[0][\"title\"]} ({movies[0].get(\"year\",\"?\")})')
+" 2>/dev/null | while IFS= read -r line; do
+                case "$line" in
+                    ERROR:*) echo "${line#ERROR:}" ;;
+                    MULTI:*) echo "Multiple matches: ${line#MULTI:}" ;;
+                    REMOVE:*)
+                        local id="${line#REMOVE:}"; id="${id%%:*}"; local name="${line#*:*:}"
+                        _curl "${RADARR_URL}/api/v3/movie/$id?deleteFiles=false" "-X DELETE -H \"X-Api-Key: $RADARR_KEY\""
+                        echo "🗑️ Removed: $name (files kept)" ;;
+                esac
+            done
+            ;;
+        missing)
+            _radarr "movie" | python3 -c "
+import sys,json
+movies = json.load(sys.stdin)
+missing = sorted([m for m in movies if not m.get('hasFile') and m.get('monitored')], key=lambda m: m.get('sortTitle',''))
+for m in missing: print(f'⏳ {m[\"title\"]} ({m.get(\"year\",\"?\")})')
+print(f'\nMissing: {len(missing)} / {len(movies)} total')
+" 2>/dev/null
+            ;;
+        *) echo "Usage: media movies [list|search|add|remove|missing]" ;;
+    esac
+}
+
+cmd_shows() {
+    local subcmd="${1:-list}"; shift 2>/dev/null || true
+    case "$subcmd" in
+        list)
+            _sonarr "series" | python3 -c "
+import sys,json
+shows = sorted(json.load(sys.stdin), key=lambda s: s.get('sortTitle',''))
+for s in shows:
+    stats = s.get('statistics',{})
+    eps = stats.get('episodeFileCount',0)
+    total = stats.get('totalEpisodeCount',0)
+    icon = '✅' if eps == total else '⏳'
+    print(f'{icon} {s[\"title\"]} ({s.get(\"year\",\"?\")}) - {eps}/{total} eps [{s.get(\"status\",\"?\")}]')
+print(f'\nTotal: {len(shows)} shows')
+" 2>/dev/null
+            ;;
+        search)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media shows search <title>"; return 1; }
+            local eq
+            eq=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$query'''))")
+            _sonarr "series/lookup?term=$eq" | python3 -c "
+import sys,json
+results = json.load(sys.stdin)[:10]
+for r in results:
+    added = '➕' if r.get('id') else ''
+    print(f'{added} [{r.get(\"tvdbId\",\"?\")}] {r[\"title\"]} ({r.get(\"year\",\"?\")}) - {r.get(\"seasonCount\",0)} seasons [{r.get(\"status\",\"?\")}]')
+    if r.get('overview'): print(f'    {r[\"overview\"][:120]}...')
+if not results: print('No results found.')
+" 2>/dev/null
+            ;;
+        add)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media shows add <title>"; return 1; }
+            local eq
+            eq=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$query'''))")
+            local lookup payload
+            lookup=$(_sonarr "series/lookup?term=$eq")
+            payload=$(echo "$lookup" | python3 -c "
+import sys,json
+results = json.load(sys.stdin)
+if not results: print('ERROR:No results found'); sys.exit(1)
+r = results[0]
+if r.get('id'): print(f'EXISTING:{r[\"title\"]} ({r.get(\"year\",\"?\")}) already in library'); sys.exit(0)
+show = {'title':r['title'],'qualityProfileId':${DEFAULT_SHOW_QUALITY},'tvdbId':r['tvdbId'],
+    'titleSlug':r.get('titleSlug',''),'images':r.get('images',[]),'seasons':r.get('seasons',[]),
+    'year':r.get('year',0),'rootFolderPath':'${DEFAULT_SHOW_ROOT}','seasonFolder':True,
+    'monitored':True,'addOptions':{'searchForMissingEpisodes':True}}
+print('ADD:'+json.dumps(show))
+" 2>/dev/null)
+            case "$payload" in
+                ERROR:*) echo "${payload#ERROR:}"; return 1 ;;
+                EXISTING:*) echo "${payload#EXISTING:}" ;;
+                ADD:*)
+                    local json_data="${payload#ADD:}"
+                    _curl_post "${SONARR_URL}/api/v3/series" "$json_data" "$SONARR_KEY" | python3 -c "
+import sys,json
+r = json.load(sys.stdin)
+print(f'✅ Added: {r[\"title\"]} ({r.get(\"year\",\"?\")}) - Searching for episodes...')
+" 2>/dev/null || echo "✅ Added show - searching for episodes..."
+                    ;;
+            esac
+            ;;
+        remove)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media shows remove <title>"; return 1; }
+            _sonarr "series" | python3 -c "
+import sys,json
+query = '''$query'''.lower()
+shows = [s for s in json.load(sys.stdin) if query in s['title'].lower()]
+if not shows: print('ERROR:No match'); sys.exit(1)
+if len(shows) > 1:
+    for s in shows: print(f'MULTI:{s[\"id\"]}: {s[\"title\"]} ({s.get(\"year\",\"?\")})')
+else: print(f'REMOVE:{shows[0][\"id\"]}:{shows[0][\"title\"]} ({shows[0].get(\"year\",\"?\")})')
+" 2>/dev/null | while IFS= read -r line; do
+                case "$line" in
+                    ERROR:*) echo "${line#ERROR:}" ;;
+                    MULTI:*) echo "Multiple matches: ${line#MULTI:}" ;;
+                    REMOVE:*)
+                        local id="${line#REMOVE:}"; id="${id%%:*}"; local name="${line#*:*:}"
+                        _curl "${SONARR_URL}/api/v3/series/$id?deleteFiles=false" "-X DELETE -H \"X-Api-Key: $SONARR_KEY\""
+                        echo "🗑️ Removed: $name (files kept)" ;;
+                esac
+            done
+            ;;
+        *) echo "Usage: media shows [list|search|add|remove]" ;;
+    esac
+}
+
+cmd_downloads() {
+    local subcmd="${1:-list}"; shift 2>/dev/null || true
+    case "$subcmd" in
+        list|"")
+            _qbit "torrents/info" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+if not data: print('No torrents.'); sys.exit(0)
+states = {}
+for t in data: states.setdefault(t.get('state','unknown'), []).append(t)
+for state, torrents in sorted(states.items()):
+    print(f'\n=== {state.upper()} ({len(torrents)}) ===')
+    for t in sorted(torrents, key=lambda x: x['name']):
+        pct = round(t['progress']*100,1)
+        size = t.get('total_size',0)/(1024**3)
+        cat = f' [{t[\"category\"]}]' if t.get('category') else ''
+        print(f'  [{pct:5.1f}%] {t[\"name\"][:65]}{cat} ({size:.1f}GB)')
+print(f'\nTotal: {len(data)} torrents')
+" 2>/dev/null
+            ;;
+        active)
+            _qbit "torrents/info" "-d 'filter=active'" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+if not data: print('No active downloads.'); sys.exit(0)
+for t in data:
+    pct = round(t['progress']*100,1)
+    speed = t.get('dlspeed',0)
+    speed_str = f'{speed/1024/1024:.1f} MB/s' if speed > 0 else 'stalled'
+    eta = t.get('eta',0)
+    eta_str = f'{eta//3600}h{(eta%3600)//60}m' if 0 < eta < 864000 else ''
+    print(f'[{pct:5.1f}%] {t[\"name\"][:60]}  ({speed_str}) {eta_str}')
+print(f'\n{len(data)} active')
+" 2>/dev/null
+            ;;
+        pause)
+            local hash="${1:-}"; [ -z "$hash" ] && { echo "Usage: media downloads pause <hash|all>"; return 1; }
+            _qbit "torrents/pause" "-d 'hashes=${hash}'"
+            echo "⏸️ Paused"
+            ;;
+        resume)
+            local hash="${1:-}"; [ -z "$hash" ] && { echo "Usage: media downloads resume <hash|all>"; return 1; }
+            _qbit "torrents/resume" "-d 'hashes=${hash}'"
+            echo "▶️ Resumed"
+            ;;
+        remove)
+            local hash="${1:-}"; [ -z "$hash" ] && { echo "Usage: media downloads remove <hash> [true]"; return 1; }
+            _qbit "torrents/delete" "-d 'hashes=$hash&deleteFiles=${2:-false}'"
+            echo "🗑️ Removed"
+            ;;
+        *) echo "Usage: media downloads [list|active|pause|resume|remove]" ;;
+    esac
+}
+
+cmd_indexers() {
+    _prowlarr "indexer" | python3 -c "
+import sys,json
+for i in json.load(sys.stdin):
+    s = '✅' if i.get('enable') else '❌'
+    print(f'{s} {i[\"name\"]} [{i.get(\"protocol\",\"?\")}] (ID: {i[\"id\"]})')
+" 2>/dev/null
+}
+
+cmd_calendar() {
+    local days="${1:-7}"
+    local start end
+    start=$(date -u +%Y-%m-%dT00:00:00Z)
+    end=$(date -u -d "+${days} days" +%Y-%m-%dT00:00:00Z 2>/dev/null || date -u -v"+${days}d" +%Y-%m-%dT00:00:00Z)
+
+    echo "=== Upcoming Episodes (${days}d) ==="
+    _sonarr "calendar?start=$start&end=$end" | python3 -c "
+import sys,json
+for e in json.load(sys.stdin):
+    s=e.get('seasonNumber',0); ep=e.get('episodeNumber',0)
+    has='✅' if e.get('hasFile') else '⏳'
+    print(f'{has} {e.get(\"airDateUtc\",\"?\")[:10]} {e.get(\"series\",{}).get(\"title\",\"?\")} S{s:02d}E{ep:02d}')
+" 2>/dev/null || echo "  Nothing scheduled."
+
+    echo ""
+    echo "=== Upcoming Movies (${days}d) ==="
+    _radarr "calendar?start=$start&end=$end" | python3 -c "
+import sys,json
+for m in json.load(sys.stdin):
+    d=m.get('digitalRelease',m.get('physicalRelease',m.get('inCinemas','?')))
+    has='✅' if m.get('hasFile') else '⏳'
+    print(f'{has} {(d or \"?\")[:10]} {m[\"title\"]} ({m.get(\"year\",\"?\")})')
+" 2>/dev/null || echo "  Nothing scheduled."
+}
+
+cmd_history() {
+    local service="${1:-all}" limit="${2:-20}"
+    if [ "$service" = "all" ] || [ "$service" = "sonarr" ]; then
+        echo "=== Sonarr History ==="
+        _sonarr "history?pageSize=$limit&sortKey=date&sortDirection=descending" | python3 -c "
+import sys,json
+for r in json.load(sys.stdin).get('records',[]):
+    print(f'  {r.get(\"date\",\"?\")[:16].replace(\"T\",\" \")} [{r.get(\"eventType\",\"?\")}] {r.get(\"series\",{}).get(\"title\",\"?\")} - {r.get(\"episode\",{}).get(\"title\",\"\")}')
+" 2>/dev/null; echo ""; fi
+    if [ "$service" = "all" ] || [ "$service" = "radarr" ]; then
+        echo "=== Radarr History ==="
+        _radarr "history?pageSize=$limit&sortKey=date&sortDirection=descending" | python3 -c "
+import sys,json
+for r in json.load(sys.stdin).get('records',[]):
+    print(f'  {r.get(\"date\",\"?\")[:16].replace(\"T\",\" \")} [{r.get(\"eventType\",\"?\")}] {r.get(\"movie\",{}).get(\"title\",\"?\")}')
+" 2>/dev/null; fi
+}
+
+cmd_queue() {
+    echo "=== Sonarr Queue ==="
+    _sonarr "queue?pageSize=50" | python3 -c "
+import sys,json
+records = json.load(sys.stdin).get('records',[])
+if not records: print('  Empty')
+for r in records:
+    pct = round(100-(r.get('sizeleft',0)/max(r.get('size',1),1))*100,1)
+    print(f'  [{pct:5.1f}%] {r.get(\"series\",{}).get(\"title\",\"?\")} - {r.get(\"episode\",{}).get(\"title\",\"\")} ({r.get(\"status\",\"?\")})')
+" 2>/dev/null
+    echo ""
+    echo "=== Radarr Queue ==="
+    _radarr "queue?pageSize=50" | python3 -c "
+import sys,json
+records = json.load(sys.stdin).get('records',[])
+if not records: print('  Empty')
+for r in records:
+    pct = round(100-(r.get('sizeleft',0)/max(r.get('size',1),1))*100,1)
+    print(f'  [{pct:5.1f}%] {r.get(\"movie\",{}).get(\"title\",\"?\")} ({r.get(\"status\",\"?\")})')
+" 2>/dev/null
+}
+
+cmd_wanted() {
+    echo "=== Wanted Episodes ==="
+    _sonarr "wanted/missing?pageSize=20&sortKey=airDateUtc&sortDirection=descending" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for r in d.get('records',[]):
+    s=r.get('seasonNumber',0); ep=r.get('episodeNumber',0)
+    print(f'  {r.get(\"airDateUtc\",\"?\")[:10]} {r.get(\"series\",{}).get(\"title\",\"?\")} S{s:02d}E{ep:02d} - {r.get(\"title\",\"\")}')
+print(f'\nTotal: {d.get(\"totalRecords\",0)}')
+" 2>/dev/null
+    echo ""
+    echo "=== Wanted Movies ==="
+    _radarr "movie" | python3 -c "
+import sys,json
+missing = sorted([m for m in json.load(sys.stdin) if not m.get('hasFile') and m.get('monitored')], key=lambda m: m.get('title',''))
+for m in missing[:20]: print(f'  {m[\"title\"]} ({m.get(\"year\",\"?\")})')
+print(f'\nTotal: {len(missing)}')
+" 2>/dev/null
+}
+
+cmd_refresh() {
+    local target="${1:-all}"
+    case "$target" in
+        movies|radarr) _curl_post "${RADARR_URL}/api/v3/command" '{"name":"RefreshMovie"}' "$RADARR_KEY" >/dev/null; echo "🔄 Radarr refresh triggered" ;;
+        shows|sonarr) _curl_post "${SONARR_URL}/api/v3/command" '{"name":"RefreshSeries"}' "$SONARR_KEY" >/dev/null; echo "🔄 Sonarr refresh triggered" ;;
+        all) cmd_refresh movies; cmd_refresh shows ;;
+        *) echo "Usage: media refresh [movies|shows|all]" ;;
+    esac
+}
+
+cmd_subs() {
+    [ -z "${BAZARR_KEY:-}" ] && { echo "Bazarr not configured. Run 'media setup'."; return 1; }
+    local subcmd="${1:-status}"; shift 2>/dev/null || true
+    case "$subcmd" in
+        status)
+            _bazarr "system/status" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Bazarr v{d.get(\"data\",d).get(\"bazarr_version\",\"?\")}')" 2>/dev/null
+            echo "\n=== Wanted Subs (Movies) ==="
+            _bazarr "movies/wanted?start=0&length=15" | python3 -c "
+import sys,json
+d=json.load(sys.stdin); data=d.get('data',[])
+for m in data[:15]:
+    langs=', '.join([s.get('name','?') for s in m.get('missing_subtitles',[])])
+    print(f'  🎬 {m.get(\"title\",\"?\")} - {langs}')
+print(f'Total: {d.get(\"total\",len(data))}')
+" 2>/dev/null
+            echo "\n=== Wanted Subs (Episodes) ==="
+            _bazarr "episodes/wanted?start=0&length=15" | python3 -c "
+import sys,json
+d=json.load(sys.stdin); data=d.get('data',[])
+for e in data[:15]:
+    langs=', '.join([s.get('name','?') for s in e.get('missing_subtitles',[])])
+    print(f'  📺 {e.get(\"seriesTitle\",\"?\")} S{e.get(\"season\",0):02d}E{e.get(\"episode\",0):02d} - {langs}')
+print(f'Total: {d.get(\"total\",len(data))}')
+" 2>/dev/null
+            ;;
+        history)
+            _bazarr "history/episodes?start=0&length=${1:-20}" | python3 -c "
+import sys,json
+for h in json.load(sys.stdin).get('data',[]):
+    icon='✅' if h.get('action')==1 else '❌'
+    print(f'{icon} {h.get(\"timestamp\",\"\")[:16]} {h.get(\"seriesTitle\",\"?\")} [{h.get(\"language\",{}).get(\"name\",\"?\")}] via {h.get(\"provider\",\"?\")}')
+" 2>/dev/null
+            ;;
+        *) echo "Usage: media subs [status|history]" ;;
+    esac
+}
+
+cmd_requests() {
+    [ -z "${JELLYSEERR_KEY:-}" ] && { echo "Jellyseerr not configured. Run 'media setup'."; return 1; }
+    local subcmd="${1:-list}"; shift 2>/dev/null || true
+    case "$subcmd" in
+        list)
+            _jellyseerr "request?take=20&skip=0&filter=pending&sort=added" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for r in d.get('results',[]):
+    media=r.get('media',{}); title=media.get('title',media.get('name','?'))
+    s={1:'⏳',2:'✅',3:'❌'}.get(r.get('status',0),'?')
+    icon='🎬' if r.get('type')=='movie' else '📺'
+    print(f'{s} {icon} {title} - {r.get(\"requestedBy\",{}).get(\"displayName\",\"?\")}')
+if not d.get('results'): print('  No pending requests')
+" 2>/dev/null
+            ;;
+        trending)
+            _jellyseerr "discover/trending" | python3 -c "
+import sys,json
+for r in json.load(sys.stdin).get('results',[])[:15]:
+    icon='🎬' if r.get('mediaType')=='movie' else '📺'
+    title=r.get('title',r.get('name','?'))
+    year=str(r.get('releaseDate',r.get('firstAirDate','')))[:4]
+    print(f'{icon} {title} ({year})')
+    o=r.get('overview','')
+    if o: print(f'    {o[:100]}...')
+" 2>/dev/null
+            ;;
+        users)
+            _jellyseerr "user?take=50" | python3 -c "
+import sys,json
+for u in json.load(sys.stdin).get('results',[]):
+    role='Admin' if u.get('permissions',0)>=16 else 'User'
+    print(f'  {u.get(\"displayName\",u.get(\"jellyfinUsername\",\"?\"))} [{role}] - {u.get(\"requestCount\",0)} requests')
+" 2>/dev/null
+            ;;
+        *) echo "Usage: media requests [list|trending|users]" ;;
+    esac
+}
+
+cmd_help() {
+    cat <<'EOF'
+media-cli - CLI for the *arr media stack
+
+USAGE: media <command> [subcommand] [args...]
+
+SETUP:
+  setup                    Interactive configuration wizard
+
+LIBRARY:
+  status                   Service health + library counts + active downloads
+  movies list|search|add|remove|missing
+  shows  list|search|add|remove
+
+DOWNLOADS:
+  downloads [list|active|pause|resume|remove]
+  queue                    Sonarr/Radarr download queues
+  wanted                   Missing episodes and movies
+
+MONITORING:
+  calendar [days]          Upcoming releases (default: 7)
+  history [sonarr|radarr|all] [limit]
+  indexers                 List Prowlarr indexers
+  refresh [movies|shows|all]
+
+SUBTITLES (Bazarr):
+  subs [status|history]
+
+REQUESTS (Jellyseerr):
+  requests [list|trending|users]
+
+REQUIREMENTS:
+  bash, curl, python3, ssh (for remote mode)
+
+CONFIG: ~/.config/media-cli/config
+EOF
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+cmd="${1:-help}"; shift 2>/dev/null || true
+
+# Setup doesn't need config
+[ "$cmd" = "setup" ] && { cmd_setup; exit 0; }
+[ "$cmd" = "help" ] || [ "$cmd" = "--help" ] || [ "$cmd" = "-h" ] && { cmd_help; exit 0; }
+
+_load_config
+
+case "$cmd" in
+    status)           cmd_status "$@" ;;
+    movies)           cmd_movies "$@" ;;
+    shows)            cmd_shows "$@" ;;
+    downloads|dl)     cmd_downloads "$@" ;;
+    queue)            cmd_queue "$@" ;;
+    wanted)           cmd_wanted "$@" ;;
+    calendar|cal)     cmd_calendar "$@" ;;
+    history)          cmd_history "$@" ;;
+    indexers)         cmd_indexers "$@" ;;
+    refresh)          cmd_refresh "$@" ;;
+    subs|subtitles)   cmd_subs "$@" ;;
+    requests|req)     cmd_requests "$@" ;;
+    *)                echo "Unknown: $cmd"; cmd_help; exit 1 ;;
+esac

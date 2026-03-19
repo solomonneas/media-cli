@@ -30,6 +30,7 @@ JELLYSEERR_URL="http://localhost:5055"
 JELLYSEERR_KEY=""
 
 FLARESOLVERR_URL="http://localhost:8191"
+TDARR_URL="http://localhost:8265"
 
 # Defaults
 DEFAULT_MOVIE_QUALITY=4        # Quality profile ID (4 = HD-1080p typically)

@@ -43,6 +43,7 @@ $ media downloads active
 | [qBittorrent](https://www.qbittorrent.org) | Required | Download monitoring and control |
 | [Bazarr](https://www.bazarr.media) | Optional | Subtitle status and history |
 | [Jellyseerr](https://github.com/Fallenbagel/jellyseerr) | Optional | User requests and trending content |
+| [Tdarr](https://tdarr.io) | Optional | Transcode monitoring (GPU/CPU worker progress) |
 
 ## Requirements
 
@@ -165,6 +166,14 @@ media requests trending        # What's trending
 media requests users           # User list with request counts
 ```
 
+### Transcoding (Tdarr)
+
+```bash
+media tdarr                    # Status, resources, active workers
+media tdarr workers            # Per-file progress: %, fps, size reduction, ETA
+media tdarr queue              # Items queued for processing
+```
+
 ## Connection Modes
 
 ### Local Mode
@@ -242,10 +251,10 @@ Works with OpenClaw, LangChain tool calling, Claude computer use, or any agent f
                          │
                     ┌────┴────┐
                     ▼         ▼
-               ┌────────┐ ┌───────────┐
-               │ Bazarr │ │Jellyseerr │
-               │  :6767 │ │   :5055   │
-               └────────┘ └───────────┘
+               ┌────────┐ ┌───────────┐ ┌───────┐
+               │ Bazarr │ │Jellyseerr │ │ Tdarr │
+               │  :6767 │ │   :5055   │ │ :8265 │
+               └────────┘ └───────────┘ └───────┘
 ```
 
 - Single bash script (~900 lines), no external dependencies
@@ -263,7 +272,7 @@ PRs welcome. Some ideas:
 - [ ] Tab completion (bash/zsh)
 - [ ] Interactive mode (fzf-based search and select)
 - [ ] Notification hooks (Discord/Telegram on download complete)
-- [ ] Tdarr integration (transcode status)
+- [x] Tdarr integration (transcode status, worker progress, queue)
 
 ## License
 

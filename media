@@ -169,6 +169,7 @@ cmd_setup() {
     read -rp "Bazarr API Key: " bazarr_key
     read -rp "Jellyseerr URL [http://localhost:5055]: " jellyseerr_url
     read -rp "Jellyseerr API Key: " jellyseerr_key
+    read -rp "Tdarr URL [http://localhost:8265]: " tdarr_url
     read -rp "FlareSolverr URL [http://localhost:8191]: " flaresolverr_url
 
     echo ""
@@ -203,6 +204,7 @@ BAZARR_URL="${bazarr_url:-http://localhost:6767}"
 BAZARR_KEY="${bazarr_key:-}"
 JELLYSEERR_URL="${jellyseerr_url:-http://localhost:5055}"
 JELLYSEERR_KEY="${jellyseerr_key:-}"
+TDARR_URL="${tdarr_url:-http://localhost:8265}"
 FLARESOLVERR_URL="${flaresolverr_url:-http://localhost:8191}"
 
 # Defaults
@@ -696,6 +698,110 @@ for u in json.load(sys.stdin).get('results',[]):
     esac
 }
 
+cmd_tdarr() {
+    local tdarr_url="${TDARR_URL:-http://localhost:8265}"
+    local subcmd="${1:-status}"; shift 2>/dev/null || true
+
+    _tdarr_get() { _curl "${tdarr_url}/api/v2/$1" ""; }
+    _tdarr_post() { 
+        if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+            local host="${MEDIA_HOST#ssh:}"
+            ssh "$host" "curl -sf --max-time 15 -X POST -H \"Content-Type: application/json\" -d \"{}\" \"${tdarr_url}/api/v2/$1\"" 2>/dev/null
+        else
+            curl -sf --max-time 15 -X POST -H "Content-Type: application/json" -d "{}" "${tdarr_url}/api/v2/$1" 2>/dev/null
+        fi
+    }
+
+    case "$subcmd" in
+        status)
+            echo "=== Tdarr Status ==="
+            local ver
+            ver=$(_tdarr_get "status" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'v{d[\"version\"]} ({d[\"os\"]})')" 2>/dev/null) || { echo "❌ Tdarr not reachable at $tdarr_url"; return 1; }
+            echo "✅ Tdarr $ver"
+            echo ""
+
+            _tdarr_post "get-res-stats" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+p = d.get('process',{}); o = d.get('os',{})
+print('=== Server Resources ===')
+print(f'  CPU:    {o.get(\"cpuPerc\",\"?\"):>6}%')
+print(f'  RAM:    {o.get(\"memUsedGB\",\"?\")}/{o.get(\"memTotalGB\",\"?\")} GB')
+print(f'  Heap:   {p.get(\"heapUsedMB\",\"?\")} MB / {p.get(\"heapTotalMB\",\"?\")} MB')
+print(f'  Uptime: {int(p.get(\"uptime\",0))//3600}h {(int(p.get(\"uptime\",0))%3600)//60}m')
+" 2>/dev/null
+
+            echo ""
+            _tdarr_post "get-db-statuses" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+print('=== Database ===')
+for k in ['LibrarySettingsJSONDB','FileJSONDB','StagedJSONDB','FlowsJSONDB']:
+    info = d.get(k,{})
+    label = k.replace('JSONDB','').replace('Settings','')
+    cnt = info.get('totalCount',0)
+    act = info.get('type','')
+    act_str = f' - {act}' if act else ''
+    print(f'  {label:<12} {cnt:>5} items{act_str}')
+" 2>/dev/null
+
+            echo ""
+            cmd_tdarr workers
+            ;;
+
+        workers)
+            echo "=== Tdarr Workers ==="
+            _tdarr_get "get-nodes" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+total = 0; active = 0
+for nid, node in d.items():
+    if not isinstance(node, dict) or 'workers' not in node: continue
+    workers = node.get('workers', {})
+    node_total = len(workers)
+    node_active = sum(1 for w in workers.values() if isinstance(w,dict) and not w.get('idle',True))
+    total += node_total; active += node_active
+    print(f'Node: {node.get(\"nodeName\", nid)}  ({node_active}/{node_total} workers active)')
+    for wid, w in workers.items():
+        if not isinstance(w, dict): continue
+        wtype = w.get('workerType','?')
+        if w.get('idle', True):
+            print(f'  ⏸️  {wid} [{wtype}] idle')
+        else:
+            pct = w.get('percentage', 0)
+            orig = w.get('originalfileSizeInGbytes', 0)
+            out  = w.get('outputFileSizeInGbytes', 0)
+            file = w.get('file','?')
+            fname = file.replace('\\\\','/').split('/')[-1][:65] if isinstance(file,str) else '?'
+            eta  = w.get('ETA','?')
+            fps  = w.get('fps','')
+            fps_str = f' @ {fps}fps' if fps else ''
+            reduction = round((1 - out/orig)*100, 1) if orig > 0 and out > 0 else 0
+            print(f'  ⚙️  {wid} [{wtype}] {pct:.1f}%{fps_str}')
+            print(f'     {fname}')
+            print(f'     {orig:.2f}GB -> {out:.2f}GB ({reduction:.1f}% smaller) ETA: {eta}')
+print(f'\nTotal: {active} active / {total} workers')
+" 2>/dev/null
+            ;;
+
+        queue)
+            echo "=== Tdarr Queue ==="
+            _tdarr_post "get-db-statuses" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+files  = d.get('FileJSONDB',{})
+staged = d.get('StagedJSONDB',{})
+print(f'  Files indexed:  {files.get(\"totalCount\",0)}')
+print(f'  Staged (queue): {staged.get(\"totalCount\",0)}')
+act = staged.get('type','')
+if act: print(f'  Status: {act}')
+" 2>/dev/null
+            ;;
+
+        *) echo "Usage: media tdarr [status|workers|queue]" ;;
+    esac
+}
+
 cmd_help() {
     cat <<'EOF'
 media-cli - CLI for the *arr media stack
@@ -727,6 +833,11 @@ SUBTITLES (Bazarr):
 REQUESTS (Jellyseerr):
   requests [list|trending|users]
 
+TRANSCODING (Tdarr):
+  tdarr [status]           Server status, resources, active workers
+  tdarr workers            Per-worker progress (file, %, fps, ETA, size savings)
+  tdarr queue              Items queued for processing
+
 REQUIREMENTS:
   bash, curl, python3, ssh (for remote mode)
 
@@ -756,5 +867,6 @@ case "$cmd" in
     refresh)          cmd_refresh "$@" ;;
     subs|subtitles)   cmd_subs "$@" ;;
     requests|req)     cmd_requests "$@" ;;
+    tdarr|transcode)  cmd_tdarr "$@" ;;
     *)                echo "Unknown: $cmd"; cmd_help; exit 1 ;;
 esac

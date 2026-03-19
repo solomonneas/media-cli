@@ -1,28 +1,65 @@
-# media-cli
+<p align="center">
+  <h1 align="center">📺 media-cli</h1>
+  <p align="center">
+    One script to manage your entire *arr media stack from the terminal.
+    <br />
+    <strong>Sonarr / Radarr / Prowlarr / qBittorrent / Bazarr / Jellyseerr</strong>
+  </p>
+</p>
 
-A single-file bash CLI for managing your Jellyfin/*arr media stack. Search, add, download, and monitor your entire media library from the terminal or through an AI agent.
+<p align="center">
+  <a href="#install">Install</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#commands">Commands</a> •
+  <a href="#ai-agent-integration">AI Agents</a> •
+  <a href="#connection-modes">Remote/SSH</a>
+</p>
 
-Works locally or over SSH for headless/remote media servers.
+---
+
+**media-cli** is a single bash script that wraps the APIs of your entire media automation stack into simple, memorable commands. No Docker, no Node, no Python packages. Just `curl`, `python3` (for JSON parsing), and your existing *arr setup.
+
+Built for humans who manage media servers from the terminal, and for AI agents that do it on their behalf.
+
+```bash
+$ media movies search "Interstellar"
+ [157336] Interstellar (2014) 169min
+    The adventures of a group of explorers who make use of a newly discovered wormhole...
+
+$ media movies add "Interstellar"
+✅ Added: Interstellar (2014) - Searching for downloads...
+
+$ media downloads active
+[  23.4%] Interstellar.2014.1080p.BluRay.x265  (4.2 MB/s) 12m
+```
 
 ## Supported Services
 
-| Service | Purpose |
-|---------|---------|
-| **Sonarr** | TV show management |
-| **Radarr** | Movie management |
-| **Prowlarr** | Indexer management |
-| **qBittorrent** | Download client |
-| **Bazarr** | Subtitle downloads (optional) |
-| **Jellyseerr** | User request portal (optional) |
+| Service | Status | What it does |
+|---------|--------|-------------|
+| [Sonarr](https://sonarr.tv) | Required | TV show search, add, monitor, manage |
+| [Radarr](https://radarr.video) | Required | Movie search, add, monitor, manage |
+| [Prowlarr](https://prowlarr.com) | Required | Indexer status and management |
+| [qBittorrent](https://www.qbittorrent.org) | Required | Download monitoring and control |
+| [Bazarr](https://www.bazarr.media) | Optional | Subtitle status and history |
+| [Jellyseerr](https://github.com/Fallenbagel/jellyseerr) | Optional | User requests and trending content |
 
 ## Requirements
 
-- `bash` (4.0+)
+- `bash` 4.0+
 - `curl`
-- `python3`
-- `ssh` (only for remote mode)
+- `python3` (standard library only, no pip)
+- `ssh` (only if using remote mode)
 
 ## Install
+
+**One-liner:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/solomonneas/media-cli/main/media -o ~/bin/media && chmod +x ~/bin/media
+```
+
+**Or clone:**
 
 ```bash
 git clone https://github.com/solomonneas/media-cli.git
@@ -30,112 +67,204 @@ cd media-cli
 bash install.sh
 ```
 
-Or just copy the `media` script to your PATH:
+Make sure `~/bin` is in your `PATH` (add `export PATH="$HOME/bin:$PATH"` to your shell profile if needed).
+
+## Quick Start
 
 ```bash
-curl -o ~/bin/media https://raw.githubusercontent.com/solomonneas/media-cli/main/media
-chmod +x ~/bin/media
-```
-
-## Setup
-
-Interactive setup wizard:
-
-```bash
+# 1. Run the setup wizard
 media setup
+
+# 2. Test your connection
+media status
+
+# 3. Start using it
+media movies search "The Matrix"
+media shows add "Breaking Bad"
+media downloads active
 ```
 
-This creates `~/.config/media-cli/config` with your API keys and connection settings. Or copy `config.example` and edit manually.
+The setup wizard asks for your API URLs and keys, then saves everything to `~/.config/media-cli/config`. You can also copy `config.example` and edit it by hand.
 
-### Connection Modes
+### Finding Your API Keys
 
-**Local** (services on this machine):
+| Service | Where to find it |
+|---------|-----------------|
+| Sonarr | Settings > General > API Key |
+| Radarr | Settings > General > API Key |
+| Prowlarr | Settings > General > API Key |
+| Bazarr | Settings > General > API Key |
+| Jellyseerr | Settings > General > API Key |
+| qBittorrent | Settings > Web UI > Username/Password |
+
+Or grab them from the config files directly:
+
+```bash
+# Linux
+grep -i apikey ~/.config/Sonarr/config.xml
+grep -i apikey ~/.config/Radarr/config.xml
+
+# Windows
+type C:\ProgramData\Sonarr\config.xml | findstr ApiKey
+
+# Docker
+docker exec sonarr cat /config/config.xml | grep ApiKey
 ```
+
+## Commands
+
+### Library
+
+```bash
+media movies list              # List all movies with download status
+media movies search "title"    # Search online (via Radarr)
+media movies add "title"       # Add top result + start downloading
+media movies remove "title"    # Remove from library (keeps files)
+media movies missing           # Show monitored movies without files
+
+media shows list               # List all shows with episode counts
+media shows search "title"     # Search online (via Sonarr)
+media shows add "title"        # Add top result + search for episodes
+media shows remove "title"     # Remove from library (keeps files)
+```
+
+### Downloads
+
+```bash
+media downloads                # List all torrents grouped by state
+media downloads active         # Active downloads with speed + ETA
+media downloads pause <hash|all>
+media downloads resume <hash|all>
+media downloads remove <hash> [true]   # true = also delete files
+```
+
+### Monitoring
+
+```bash
+media status                   # Service health + library counts + active downloads
+media queue                    # Sonarr/Radarr download queues
+media wanted                   # Missing episodes and movies
+media calendar [days]          # Upcoming releases (default: 7 days)
+media history [sonarr|radarr|all] [limit]
+media indexers                 # List Prowlarr indexers
+media refresh [movies|shows|all]   # Trigger library rescan
+```
+
+### Subtitles (Bazarr)
+
+```bash
+media subs                     # Wanted subtitles for movies + episodes
+media subs history             # Recent subtitle downloads
+```
+
+### Requests (Jellyseerr)
+
+```bash
+media requests                 # Pending user requests
+media requests trending        # What's trending
+media requests users           # User list with request counts
+```
+
+## Connection Modes
+
+### Local Mode
+
+Services run on the same machine as the CLI:
+
+```bash
 MEDIA_HOST="local"
 ```
 
-**SSH** (services on a remote host, binding to localhost):
-```
-MEDIA_HOST="ssh:myserver"
-MEDIA_HOST_OS="linux"    # or "windows"
-```
+### SSH Mode
 
-The SSH mode runs curl commands on the remote host, so it works even when services only bind to `127.0.0.1`.
-
-## Usage
+Services run on a remote host (NAS, dedicated server, Windows box) and bind to `localhost`. The CLI runs curl commands over SSH:
 
 ```bash
-# Check everything is working
-media status
-
-# Search and add content
-media movies search "Interstellar"
-media movies add "Interstellar"
-media shows search "Breaking Bad"
-media shows add "Breaking Bad"
-
-# Library management
-media movies list
-media movies missing
-media shows list
-
-# Downloads
-media downloads active
-media downloads list
-media downloads pause all
-media downloads resume all
-
-# Monitoring
-media queue                  # Sonarr/Radarr queues
-media wanted                 # Missing content
-media calendar 14            # Upcoming releases
-media history                # Recent activity
-media indexers               # Prowlarr indexers
-
-# Subtitles (requires Bazarr)
-media subs status
-media subs history
-
-# Requests (requires Jellyseerr)
-media requests list
-media requests trending
-
-# Maintenance
-media refresh                # Trigger library scan
+MEDIA_HOST="ssh:mediaserver"     # Uses your SSH config alias
+MEDIA_HOST_OS="linux"            # or "windows"
 ```
+
+This is the killer feature for headless servers. Your services don't need to be exposed to the network. The CLI tunnels everything through SSH.
+
+**Windows hosts work too.** POST requests automatically use PowerShell's `Invoke-RestMethod` when `MEDIA_HOST_OS="windows"`, so you don't need curl installed on the Windows side.
 
 ## AI Agent Integration
 
-This CLI was originally built for use with [OpenClaw](https://openclaw.ai) (an AI agent platform), but works great with any AI assistant or automation tool that can run shell commands.
+This CLI was built alongside [OpenClaw](https://openclaw.ai), an AI agent platform. The commands are designed to be easily parsed by AI assistants.
 
-Example prompt for your AI agent:
-> "Search for 'The Good Place' and add it to my library"
+Any AI agent or automation tool that can run shell commands can use media-cli:
 
-The agent runs:
+**Natural language to commands:**
+
+> "What shows am I missing episodes for?"
 ```bash
-media shows search "The Good Place"
-media shows add "The Good Place"
+media wanted
 ```
+
+> "Add Succession and start downloading it"
+```bash
+media shows add "Succession"
+```
+
+> "What's actively downloading right now?"
+```bash
+media downloads active
+```
+
+> "Pause all downloads"
+```bash
+media downloads pause all
+```
+
+Works with OpenClaw, LangChain tool calling, Claude computer use, or any agent framework that supports shell execution.
 
 ## How It Works
 
-- Single bash script, no dependencies beyond curl and python3
-- Talks to *arr APIs (v3 for Sonarr/Radarr, v1 for Prowlarr)
-- qBittorrent uses cookie-based auth (WebUI API v2)
-- All credentials stay in your local config file (chmod 600)
-- Python is used only for JSON parsing (no pip packages needed)
+```
+┌──────────────┐     ┌─────────────────────────┐
+│  media-cli   │────▶│  SSH (optional)          │
+│  (your box)  │     │  curl commands run on    │
+└──────────────┘     │  the media server        │
+                     └───────────┬─────────────┘
+                                 │
+                    ┌────────────┼────────────┐
+                    ▼            ▼            ▼
+               ┌────────┐  ┌────────┐  ┌──────────┐
+               │ Sonarr  │  │ Radarr │  │ Prowlarr │
+               │  :8989  │  │  :7878 │  │  :9696   │
+               └────────┘  └────────┘  └──────────┘
+                    │            │
+                    ▼            ▼
+               ┌──────────────────────┐
+               │    qBittorrent       │
+               │       :8080          │
+               └──────────────────────┘
+                         │
+                    ┌────┴────┐
+                    ▼         ▼
+               ┌────────┐ ┌───────────┐
+               │ Bazarr │ │Jellyseerr │
+               │  :6767 │ │   :5055   │
+               └────────┘ └───────────┘
+```
 
-## API Key Locations
+- Single bash script (~900 lines), no external dependencies
+- Talks to *arr v3 APIs (Sonarr/Radarr), v1 (Prowlarr), v2 (qBittorrent WebUI)
+- Python3 is used strictly for JSON parsing (standard library only)
+- Config file is stored at `~/.config/media-cli/config` with `chmod 600`
+- No telemetry, no analytics, no network calls except to your own services
 
-| Service | Config File | Key Field |
-|---------|------------|-----------|
-| Sonarr | `config.xml` in Sonarr data dir | `<ApiKey>` |
-| Radarr | `config.xml` in Radarr data dir | `<ApiKey>` |
-| Prowlarr | `config.xml` in Prowlarr data dir | `<ApiKey>` |
-| Bazarr | `config.yaml` in Bazarr data dir | `auth.apikey` |
-| Jellyseerr | `settings.json` in Jellyseerr config | `main.apiKey` |
-| qBittorrent | WebUI settings | Username/password |
+## Contributing
+
+PRs welcome. Some ideas:
+
+- [ ] Lidarr support (music)
+- [ ] Readarr support (books)
+- [ ] Tab completion (bash/zsh)
+- [ ] Interactive mode (fzf-based search and select)
+- [ ] Notification hooks (Discord/Telegram on download complete)
+- [ ] Tdarr integration (transcode status)
 
 ## License
 
-MIT
+[MIT](LICENSE)

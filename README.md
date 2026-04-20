@@ -56,6 +56,7 @@ $ media downloads active
 | [Bazarr](https://www.bazarr.media) | Optional | Subtitle status and history |
 | [Jellyseerr](https://github.com/Fallenbagel/jellyseerr) | Optional | User requests and trending content |
 | [Tdarr](https://tdarr.io) | Optional | Transcode monitoring (GPU/CPU worker progress) |
+| [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) | Optional | Cloudflare challenge proxy for Prowlarr indexers |
 
 ## Requirements
 
@@ -213,6 +214,28 @@ media qbit harden status       # Show current state + blocked extensions
 ```
 
 See [Malware Hardening](#malware-hardening) below for the full story.
+
+### Cloudflare (FlareSolverr)
+
+Prowlarr relies on [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) to pass Cloudflare's "checking your browser" challenge on indexers. When Prowlarr indexer tests start failing mysteriously, FlareSolverr is usually the culprit — either unreachable or its session cache has gone stale.
+
+```bash
+media flaresolverr               # Status + version + active session count
+media flaresolverr sessions      # List active sessions
+media flaresolverr test <url>    # Solve a challenge against a URL (triage)
+media flaresolverr clear         # Destroy all sessions (reset stale state)
+media flaresolverr clear <id>    # Destroy a specific session
+```
+
+Typical triage when an indexer test fails in Prowlarr:
+
+```bash
+media flaresolverr                           # Is the service up?
+media flaresolverr test https://1337x.to     # Can it actually solve a challenge?
+media flaresolverr clear                     # If sessions look stale, nuke them
+```
+
+`clear` is safe — FlareSolverr re-creates sessions on demand; Prowlarr reconnects automatically on the next request.
 
 ## Connection Modes
 

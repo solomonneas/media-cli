@@ -319,17 +319,6 @@ media-cli doesn't automate these two — they're host-OS-specific and the right 
 
 **Disabling:** `media qbit harden off` is a single round-trip API call that clears `excluded_file_names` and sets `excluded_file_names_enabled=false`. Does not touch anything else.
 
-## Contributing
-
-PRs welcome. Some ideas:
-
-- [ ] Lidarr support (music)
-- [ ] Readarr support (books)
-- [ ] Tab completion (bash/zsh)
-- [ ] Interactive mode (fzf-based search and select)
-- [ ] Notification hooks (Discord/Telegram on download complete)
-- [x] Tdarr integration (transcode status, worker progress, queue)
-
 ## License
 
 [MIT](LICENSE)

@@ -172,7 +172,27 @@ media requests users           # User list with request counts
 media tdarr                    # Status, resources, active workers
 media tdarr workers            # Per-file progress: %, fps, size reduction, ETA
 media tdarr queue              # Items queued for processing
+
+# Control
+media tdarr boost on           # Disable schedule + set 3 GPU workers (burn through queue)
+media tdarr boost off          # Re-enable schedule (restore time-based rotation)
+media tdarr boost              # Show current state
+media tdarr schedule on|off    # Enable/disable Tdarr's time-based schedule
+media tdarr workers set transcodegpu 3   # Set worker limit for a type
+                               # types: transcodegpu, transcodecpu, healthcheckgpu, healthcheckcpu
 ```
+
+`boost on` is the "I want this library re-encoded by morning" button. It flips `scheduleEnabled=false` and maxes `workerLimits.transcodegpu` to 3 (override with `TDARR_BOOST_GPU_WORKERS=5 media tdarr boost on`). `boost off` re-enables the schedule; your usual day/night rotation resumes.
+
+### Security (qBittorrent)
+
+```bash
+media qbit harden on           # Enable malware extension blocking (default after setup)
+media qbit harden off          # Disable
+media qbit harden status       # Show current state + blocked extensions
+```
+
+See [Malware Hardening](#malware-hardening) below for the full story.
 
 ## Connection Modes
 
@@ -262,6 +282,40 @@ Works with OpenClaw, LangChain tool calling, Claude computer use, or any agent f
 - Python3 is used strictly for JSON parsing (standard library only)
 - Config file is stored at `~/.config/media-cli/config` with `chmod 600`
 - No telemetry, no analytics, no network calls except to your own services
+
+## Malware Hardening
+
+Poisoned `*arr` releases are a real thing. In April 2026 the maintainer's Gandalf server caught LummaStealer-class payloads delivered as fake video-named `.exe` / `.scr` files inside releases for popular shows. Legit video releases do not contain executables.
+
+media-cli ships a one-command hardening layer that sets qBittorrent's global `excluded_file_names` preference so these files never hit disk:
+
+```bash
+media qbit harden on        # Enabled by default after `media setup`
+media qbit harden off       # Opt out
+media qbit harden status    # Inspect current state
+```
+
+**Blocked by default:**
+
+```
+*.scr *.pif *.vbs *.wsf *.hta *.lnk *.jar *.com *.msi
+*.js *.jse *.vbe *.ps1 *.psm1 *.reg *.dll
+```
+
+**Deliberately NOT blocked:** `.exe` and `.bat`. Some qBittorrent users legitimately download non-media content that needs these (game installers, etc.). If you only use qB for media, add them:
+
+```bash
+QBIT_HARDEN_EXTRAS="*.exe *.bat" media qbit harden on
+```
+
+**This is one layer of three.** For a full defense-in-depth stack on a Windows media host you also want:
+
+1. **Windows Defender exclusions + real-time scanning on your downloads directory.** Don't disable Defender for your whole drive; just exclude the specific legit-but-false-positive paths you know about.
+2. **qB autorun hook that deletes executables in media-category torrents only.** qBittorrent can run a command "on torrent completed" — point it at a script that walks the completed torrent and deletes any executables if the category is your Sonarr/Radarr category. That way manual downloads in other categories aren't touched.
+
+media-cli doesn't automate these two — they're host-OS-specific and the right paths/categories depend on your setup. The CLI handles the one layer that's cleanly API-addressable across platforms (qBittorrent's own preference).
+
+**Disabling:** `media qbit harden off` is a single round-trip API call that clears `excluded_file_names` and sets `excluded_file_names_enabled=false`. Does not touch anything else.
 
 ## Contributing
 

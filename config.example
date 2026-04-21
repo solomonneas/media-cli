@@ -37,6 +37,12 @@ TDARR_URL="http://localhost:8265"
 # UNPACKERR_LOG="C:/ProgramData/Unpackerr/unpackerr.log"   # Windows default
 # UNPACKERR_LOG="/config/unpackerr/unpackerr.log"          # Linux (varies by install)
 
+# Recyclarr is a local binary, not a daemon. `media recyclarr` shells out.
+# RECYCLARR_BIN defaults to "recyclarr" (PATH lookup) if empty.
+# RECYCLARR_CONFIG is optional; when set it's passed as `-c` on sync/list.
+# RECYCLARR_BIN="C:/ProgramData/Recyclarr/recyclarr.exe"
+# RECYCLARR_CONFIG="C:/ProgramData/Recyclarr/recyclarr.yml"
+
 # Defaults
 DEFAULT_MOVIE_QUALITY=4        # Quality profile ID (4 = HD-1080p typically)
 DEFAULT_SHOW_QUALITY=4

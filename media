@@ -94,6 +94,35 @@ _jellyseerr() {
     _curl "${JELLYSEERR_URL}/api/v1/$endpoint" "-H \"X-Api-Key: $JELLYSEERR_KEY\"" "$@"
 }
 
+# Run the local (or remote) recyclarr binary with the given args. Output
+# streams straight back. Caller supplies any -c/--config flag explicitly;
+# cmd_recyclarr injects RECYCLARR_CONFIG for sync/list/delete (the
+# subcommands that accept it).
+_recyclarr_run() {
+    local bin="${RECYCLARR_BIN:-recyclarr}"
+    if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+        local host="${MEDIA_HOST#ssh:}"
+        local ps_args=""
+        local a
+        for a in "$@"; do
+            a="${a//\'/\'\'}"   # double single-quotes for PowerShell literal quoting
+            ps_args="$ps_args '$a'"
+        done
+        if [ "${MEDIA_HOST_OS:-linux}" = "windows" ]; then
+            ssh "$host" "powershell -NoProfile -Command \"& '$bin'$ps_args\""
+        else
+            local lin_args=""
+            for a in "$@"; do
+                a="${a//\'/\'\\\'\'}"
+                lin_args="$lin_args '$a'"
+            done
+            ssh "$host" "'$bin'$lin_args"
+        fi
+    else
+        "$bin" "$@"
+    fi
+}
+
 # Unpackerr exposes no HTTP API by default. We read its log file instead.
 # PowerShell is used for remote Windows hosts because `tail` is not standard
 # there; local mode assumes the user has a Unix-compatible `tail` (Git Bash,
@@ -1354,6 +1383,115 @@ EOF
     esac
 }
 
+### Recyclarr ###
+# Syncs TRaSH-guide quality profiles and custom formats into Sonarr/Radarr.
+# It's a local binary, not a daemon, so we just shell out. Set RECYCLARR_BIN
+# to the executable path and RECYCLARR_CONFIG to your recyclarr.yml; the
+# config arg is appended automatically for sync/list/delete.
+cmd_recyclarr() {
+    local subcmd="${1:-status}"; shift 2>/dev/null || true
+    local cfg_args=()
+    [ -n "${RECYCLARR_CONFIG:-}" ] && cfg_args=(-c "$RECYCLARR_CONFIG")
+
+    case "$subcmd" in
+        status|"")
+            echo "Binary: ${RECYCLARR_BIN:-recyclarr (from PATH)}"
+            echo "Config: ${RECYCLARR_CONFIG:-<default search locations>}"
+            echo ""
+            _recyclarr_run --version
+            ;;
+
+        diff|preview|dry-run)
+            # Dry-run sync. Recyclarr prints a colored diff of what *would*
+            # change. Always safe to run; makes no API writes.
+            _recyclarr_run sync --preview "${cfg_args[@]}" "$@"
+            ;;
+
+        sync|apply)
+            _recyclarr_run sync "${cfg_args[@]}" "$@"
+            ;;
+
+        list)
+            local kind="${1:-}"; shift 2>/dev/null || true
+            case "$kind" in
+                formats|custom-formats|cf)
+                    local svc="${1:-sonarr}"
+                    _recyclarr_run list custom-formats "$svc"
+                    ;;
+                profiles|quality-profiles|qp)
+                    local svc="${1:-sonarr}"
+                    _recyclarr_run list quality-profiles "$svc"
+                    ;;
+                naming)
+                    local svc="${1:-sonarr}"
+                    _recyclarr_run list naming "$svc"
+                    ;;
+                templates)
+                    _recyclarr_run config list templates
+                    ;;
+                "")
+                    cat <<'EOF'
+Usage: media recyclarr list <kind> [sonarr|radarr]
+
+  formats [svc]     Custom formats in the guide (default: sonarr)
+  profiles [svc]    Quality profiles in the guide
+  naming [svc]      Media naming formats in the guide
+  templates         Local config templates known to recyclarr
+EOF
+                    ;;
+                *)
+                    echo "Unknown list kind: $kind"
+                    return 1
+                    ;;
+            esac
+            ;;
+
+        config|show)
+            # Print the active config file. Matches the 'status' binary/config
+            # summary by giving the actual YAML we'll sync.
+            if [ -z "${RECYCLARR_CONFIG:-}" ]; then
+                echo "❌ RECYCLARR_CONFIG is not set. Nothing to show."
+                return 1
+            fi
+            if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+                local host="${MEDIA_HOST#ssh:}"
+                if [ "${MEDIA_HOST_OS:-linux}" = "windows" ]; then
+                    ssh "$host" "powershell -NoProfile -Command \"Get-Content -LiteralPath '$RECYCLARR_CONFIG'\""
+                else
+                    ssh "$host" "cat '$RECYCLARR_CONFIG'"
+                fi
+            else
+                cat "$RECYCLARR_CONFIG"
+            fi
+            ;;
+
+        help|--help|-h)
+            cat <<'EOF'
+Usage: media recyclarr <subcommand>
+
+  status                  Show binary path, config path, and recyclarr version (default)
+  diff                    Dry-run sync (alias: preview): shows changes without applying
+  sync                    Apply config to Sonarr/Radarr
+  list formats [svc]      List TRaSH custom formats for sonarr|radarr (default: sonarr)
+  list profiles [svc]     List TRaSH quality profiles
+  list naming [svc]       List media naming formats
+  list templates          List local config templates
+  config                  Print the active recyclarr.yml
+
+Config:
+  RECYCLARR_BIN       Path to the recyclarr binary (default: PATH lookup)
+  RECYCLARR_CONFIG    Path to your recyclarr.yml (passed as -c when relevant)
+EOF
+            ;;
+
+        *)
+            echo "Unknown recyclarr subcommand: $subcmd"
+            echo "Run 'media recyclarr help' for usage."
+            return 1
+            ;;
+    esac
+}
+
 cmd_help() {
     cat <<'EOF'
 media-cli - CLI for the *arr media stack
@@ -1409,6 +1547,13 @@ EXTRACT (Unpackerr):
   unpackerr waiting        Items stuck as "completed but no extractable files"
   unpackerr log [N]        Raw log tail (default 50 lines)
 
+QUALITY (Recyclarr):
+  recyclarr [status]       Version + config summary
+  recyclarr diff           Dry-run (preview changes without syncing)
+  recyclarr sync           Apply TRaSH guide config to Sonarr/Radarr
+  recyclarr list <kind>    formats|profiles|naming|templates
+  recyclarr config         Print the active recyclarr.yml
+
 REQUIREMENTS:
   bash, curl, python3, ssh (for remote mode)
 
@@ -1443,5 +1588,6 @@ case "$cmd" in
     flaresolverr|flare|cf)
                       cmd_flaresolverr "$@" ;;
     unpackerr|unpack) cmd_unpackerr "$@" ;;
+    recyclarr|trash)  cmd_recyclarr "$@" ;;
     *)                echo "Unknown: $cmd"; cmd_help; exit 1 ;;
 esac

@@ -32,6 +32,11 @@ JELLYSEERR_KEY=""
 FLARESOLVERR_URL="http://localhost:8191"
 TDARR_URL="http://localhost:8265"
 
+# Unpackerr has no HTTP API; `media unpackerr` reads its log file directly.
+# Point this at the log path for your install. Leave empty to disable.
+# UNPACKERR_LOG="C:/ProgramData/Unpackerr/unpackerr.log"   # Windows default
+# UNPACKERR_LOG="/config/unpackerr/unpackerr.log"          # Linux (varies by install)
+
 # Defaults
 DEFAULT_MOVIE_QUALITY=4        # Quality profile ID (4 = HD-1080p typically)
 DEFAULT_SHOW_QUALITY=4

@@ -94,6 +94,26 @@ _jellyseerr() {
     _curl "${JELLYSEERR_URL}/api/v1/$endpoint" "-H \"X-Api-Key: $JELLYSEERR_KEY\"" "$@"
 }
 
+# Unpackerr exposes no HTTP API by default. We read its log file instead.
+# PowerShell is used for remote Windows hosts because `tail` is not standard
+# there; local mode assumes the user has a Unix-compatible `tail` (Git Bash,
+# WSL, etc.) since the rest of the script already does.
+_unpackerr_log() {
+    local n="${1:-500}"
+    local path="${UNPACKERR_LOG:-}"
+    [ -z "$path" ] && return 1
+    if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
+        local host="${MEDIA_HOST#ssh:}"
+        if [ "${MEDIA_HOST_OS:-linux}" = "windows" ]; then
+            ssh "$host" "powershell -NoProfile -Command \"Get-Content -LiteralPath '$path' -Tail $n\"" 2>/dev/null
+        else
+            ssh "$host" "tail -n $n '$path'" 2>/dev/null
+        fi
+    else
+        tail -n "$n" "$path" 2>/dev/null
+    fi
+}
+
 # Generic POST helper: sends a JSON body to $url with no auth header.
 # Handles the local / SSH-Linux / SSH-Windows split so callers don't reinvent it.
 # Tried before: piping via `ssh host 'curl --data-binary @-' <<< body` — silently
@@ -1258,6 +1278,82 @@ print('endpoint for that was removed in Tdarr v2.63.')
     esac
 }
 
+### Unpackerr ###
+# Unpackerr extracts rar'd releases on behalf of Sonarr/Radarr so they can
+# import them. It has no HTTP API in its default config, so this reads the
+# log file directly. Point UNPACKERR_LOG at the install's log path.
+cmd_unpackerr() {
+    local subcmd="${1:-status}"; shift 2>/dev/null || true
+    if [ -z "${UNPACKERR_LOG:-}" ]; then
+        echo "❌ UNPACKERR_LOG is not configured. Add it to your config:"
+        echo "   UNPACKERR_LOG=\"C:/ProgramData/Unpackerr/unpackerr.log\"  (Windows default)"
+        return 1
+    fi
+
+    case "$subcmd" in
+        status|"")
+            local out; out=$(_unpackerr_log 500) || { echo "❌ Could not read $UNPACKERR_LOG"; return 1; }
+            if [ -z "$out" ]; then
+                echo "❌ Log is empty or unreadable at $UNPACKERR_LOG"
+                return 1
+            fi
+            local last_queue;  last_queue=$(echo "$out"  | grep -E '\[Unpackerr\] Queue:'  | tail -1)
+            local last_totals; last_totals=$(echo "$out" | grep -E '\[Unpackerr\] Totals:' | tail -1)
+            local last_start;  last_start=$(echo "$out"  | grep -E 'Unpackerr v[0-9].*Starting!' | tail -1)
+            if [ -n "$last_start" ]; then
+                echo "🟢 $(echo "$last_start" | sed -E 's/^\[INFO\] //')"
+            fi
+            if [ -n "$last_queue" ]; then
+                echo "📦 $last_queue"
+            else
+                echo "⚠️  No queue activity logged yet. Either the queue is empty or logging hasn't"
+                echo "   produced a cycle. Check 'media unpackerr log' for raw tail."
+            fi
+            [ -n "$last_totals" ] && echo "📊 $last_totals"
+            ;;
+
+        recent|activity)
+            local n="${1:-25}"
+            _unpackerr_log 1000 \
+                | grep -E '\[(Sonarr|Radarr|Lidarr|Readarr)\]' \
+                | tail -n "$n"
+            ;;
+
+        waiting|stuck)
+            # Items Sonarr/Radarr marked complete but that Unpackerr couldn't
+            # extract. Often the release had no rar, or is already a valid
+            # media file and import is blocked for a different reason.
+            _unpackerr_log 2000 \
+                | grep -E 'Completed item still waiting' \
+                | tail -25
+            ;;
+
+        log|tail)
+            local n="${1:-50}"
+            _unpackerr_log "$n"
+            ;;
+
+        help|--help|-h)
+            cat <<'EOF'
+Usage: media unpackerr <subcommand>
+
+  status              Last-known queue counts + totals (default)
+  recent [N]          Last N per-item status lines from *arr servers (default 25)
+  waiting             Items stuck as "completed but no extractable files"
+  log [N]             Raw log tail (default 50 lines)
+
+Unpackerr has no HTTP API; this command reads UNPACKERR_LOG directly.
+EOF
+            ;;
+
+        *)
+            echo "Unknown unpackerr subcommand: $subcmd"
+            echo "Run 'media unpackerr help' for usage."
+            return 1
+            ;;
+    esac
+}
+
 cmd_help() {
     cat <<'EOF'
 media-cli - CLI for the *arr media stack
@@ -1307,6 +1403,12 @@ CLOUDFLARE (FlareSolverr):
   flaresolverr test <url>  Solve a Cloudflare challenge (triage Prowlarr failures)
   flaresolverr clear [id]  Destroy all sessions, or a specific one
 
+EXTRACT (Unpackerr):
+  unpackerr [status]       Last-known queue counts + totals (reads UNPACKERR_LOG)
+  unpackerr recent [N]     Recent per-item status lines (default 25)
+  unpackerr waiting        Items stuck as "completed but no extractable files"
+  unpackerr log [N]        Raw log tail (default 50 lines)
+
 REQUIREMENTS:
   bash, curl, python3, ssh (for remote mode)
 
@@ -1340,5 +1442,6 @@ case "$cmd" in
     qbit|qbittorrent) cmd_qbit "$@" ;;
     flaresolverr|flare|cf)
                       cmd_flaresolverr "$@" ;;
+    unpackerr|unpack) cmd_unpackerr "$@" ;;
     *)                echo "Unknown: $cmd"; cmd_help; exit 1 ;;
 esac

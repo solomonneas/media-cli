@@ -106,9 +106,12 @@ _jellyseerr() {
     _curl "${JELLYSEERR_URL}/api/v1/$endpoint" "-H \"X-Api-Key: $JELLYSEERR_KEY\"" "$@"
 }
 
-_readarr() {
-    local endpoint="$1"; shift
-    _curl "${READARR_URL}/api/v1/$endpoint" "-H \"X-Api-Key: $READARR_KEY\"" "$@"
+_readarr_api() {
+    # Usage: _readarr_api <url> <key> <endpoint> [extra curl args...]
+    # Multi-instance capable (audiobooks vs ebooks); callers pass the
+    # instance URL/key rather than relying on a single global pair.
+    local url="$1"; local key="$2"; local endpoint="$3"; shift 3
+    _curl "${url}/api/v1/$endpoint" "-H \"X-Api-Key: $key\"" "$@"
 }
 
 # Run the local (or remote) recyclarr binary with the given args. Output
@@ -1324,16 +1327,16 @@ print('endpoint for that was removed in Tdarr v2.63.')
     esac
 }
 
-### Audiobooks (Readarr) ###
-# Readarr powers the audiobooks namespace. When Readarr is used as an ebooks
-# instance too, point READARR_URL at a different instance and swap the default
-# quality profile (1 = eBook, 2 = Spoken).
-cmd_audiobooks() {
+### Audiobooks + Ebooks (Readarr) ###
+# Two Readarr instances (audiobooks on 8787, ebooks on 8788) share this code.
+# cmd_audiobooks and cmd_ebooks are thin wrappers that hand the instance's
+# URL/key/root/quality/metadata + an isEbook flag to _cmd_readarr_books.
+_cmd_readarr_books() {
+    # Positional: LABEL URL KEY ROOT QP MP IS_EBOOK <subcmd args...>
+    local label="$1"; local url="$2"; local key="$3"
+    local root="$4"; local qp="$5"; local mp="$6"; local is_ebook="$7"
+    shift 7
     local subcmd="${1:-list}"; shift 2>/dev/null || true
-    if [ -z "${READARR_URL:-}" ] || [ -z "${READARR_KEY:-}" ]; then
-        echo "❌ READARR_URL / READARR_KEY not configured. Run 'media setup' or edit the config."
-        return 1
-    fi
 
     case "$subcmd" in
         list|ls)
@@ -1342,8 +1345,8 @@ cmd_audiobooks() {
             # JSON is passed through env vars to avoid shell-quote breakage on
             # titles containing apostrophes ("Annie's Day"), backslashes, etc.
             local books_json authors_json
-            books_json=$(_readarr "book")
-            authors_json=$(_readarr "author")
+            books_json=$(_readarr_api "$url" "$key" "book")
+            authors_json=$(_readarr_api "$url" "$key" "author")
             ARRCLI_BOOKS="$books_json" ARRCLI_AUTHORS="$authors_json" python3 -c "
 import os, json
 books   = json.loads(os.environ.get('ARRCLI_BOOKS') or '[]')
@@ -1364,10 +1367,10 @@ print(f'\nTotal: {len(books)} books')
 
         search)
             local query="$*"
-            [ -z "$query" ] && { echo "Usage: media audiobooks search <title or author>"; return 1; }
+            [ -z "$query" ] && { echo "Usage: media $label search <title or author>"; return 1; }
             local eq
             eq=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
-            _readarr "book/lookup?term=$eq" | python3 -c "
+            _readarr_api "$url" "$key" "book/lookup?term=$eq" | python3 -c "
 import sys, json
 results = (json.load(sys.stdin) or [])[:10]
 for r in results:
@@ -1389,10 +1392,10 @@ if not results: print('No results found.')
             # a populated editions array. We synthesize an edition from the book
             # fields and pair it with a separate author lookup.
             local query="$*"
-            [ -z "$query" ] && { echo "Usage: media audiobooks add <title or author>"; return 1; }
+            [ -z "$query" ] && { echo "Usage: media $label add <title or author>"; return 1; }
             local eq
             eq=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
-            local book_lookup; book_lookup=$(_readarr "book/lookup?term=$eq")
+            local book_lookup; book_lookup=$(_readarr_api "$url" "$key" "book/lookup?term=$eq")
             local author_term
             author_term=$(echo "$book_lookup" | python3 -c "
 import sys, json
@@ -1416,7 +1419,7 @@ print(at)
             fi
             local author_eq
             author_eq=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$author_term")
-            local author_lookup; author_lookup=$(_readarr "author/lookup?term=$author_eq")
+            local author_lookup; author_lookup=$(_readarr_api "$url" "$key" "author/lookup?term=$author_eq")
 
             local payload
             payload=$(ARRCLI_BOOKS="$book_lookup" ARRCLI_AUTHORS="$author_lookup" python3 -c "
@@ -1435,6 +1438,7 @@ a = authors[0]
 qp   = int(os.environ.get('ARRCLI_QP','2'))
 mp   = int(os.environ.get('ARRCLI_MP','1'))
 root = os.environ.get('ARRCLI_ROOT','')
+is_ebook = os.environ.get('ARRCLI_IS_EBOOK','False') == 'True'
 
 edition = {
     'foreignEditionId': b.get('foreignEditionId',''),
@@ -1444,7 +1448,7 @@ edition = {
     'images':           b.get('images',[]),
     'monitored':        True,
     'manualAdd':        False,
-    'isEbook':          False,
+    'isEbook':          is_ebook,
     'disambiguation':   b.get('disambiguation',''),
     'pageCount':        b.get('pageCount',0),
 }
@@ -1473,16 +1477,17 @@ book_payload = {
     'addOptions':    {'searchForNewBook': True},
 }
 print('ADD:' + json.dumps(book_payload))
-" ARRCLI_QP="${DEFAULT_AUDIOBOOK_QUALITY:-2}" \
-  ARRCLI_MP="${DEFAULT_AUDIOBOOK_METADATA:-1}" \
-  ARRCLI_ROOT="${DEFAULT_AUDIOBOOK_ROOT:-}" 2>/dev/null)
+" ARRCLI_QP="$qp" \
+  ARRCLI_MP="$mp" \
+  ARRCLI_ROOT="$root" \
+  ARRCLI_IS_EBOOK="$is_ebook" 2>/dev/null)
             case "$payload" in
                 ERROR:*) echo "${payload#ERROR:}"; return 1 ;;
                 EXISTING:*) echo "${payload#EXISTING:}" ;;
                 ADD:*)
                     local json_data="${payload#ADD:}"
                     local post_resp
-                    post_resp=$(_curl_post "${READARR_URL}/api/v1/book" "$json_data" "$READARR_KEY")
+                    post_resp=$(_curl_post "${url}/api/v1/book" "$json_data" "$key")
                     if [ -z "$post_resp" ]; then
                         echo "❌ Add failed: no response from Readarr. Check the log at C:\\ProgramData\\Readarr\\logs\\readarr.txt"
                         return 1
@@ -1507,8 +1512,8 @@ except json.JSONDecodeError:
 
         missing)
             local books_json authors_json
-            books_json=$(_readarr "book")
-            authors_json=$(_readarr "author")
+            books_json=$(_readarr_api "$url" "$key" "book")
+            authors_json=$(_readarr_api "$url" "$key" "author")
             ARRCLI_BOOKS="$books_json" ARRCLI_AUTHORS="$authors_json" python3 -c "
 import os, json
 books   = json.loads(os.environ.get('ARRCLI_BOOKS') or '[]')
@@ -1530,9 +1535,9 @@ print(f'\nMissing: {len(missing)} / {len(books)} total')
 
         remove|rm)
             local query="$*"
-            [ -z "$query" ] && { echo "Usage: media audiobooks remove <title>"; return 1; }
+            [ -z "$query" ] && { echo "Usage: media $label remove <title>"; return 1; }
             local books
-            books=$(_readarr "book")
+            books=$(_readarr_api "$url" "$key" "book")
             echo "$books" | python3 -c "
 import sys, json
 query = '''$query'''.lower()
@@ -1553,15 +1558,15 @@ else:
                     MULTI:*) echo "Multiple matches: ${line#MULTI:}" ;;
                     REMOVE:*)
                         local id="${line#REMOVE:}"; id="${id%%:*}"; local name="${line#*:*:}"
-                        _curl "${READARR_URL}/api/v1/book/$id?deleteFiles=false" "-X DELETE -H \"X-Api-Key: $READARR_KEY\"" >/dev/null
+                        _curl "${url}/api/v1/book/$id?deleteFiles=false" "-X DELETE -H \"X-Api-Key: $key\"" >/dev/null
                         echo "🗑️ Removed: $name (files kept)" ;;
                 esac
             done
             ;;
 
         help|--help|-h)
-            cat <<'EOF'
-Usage: media audiobooks <subcommand>
+            cat <<EOF
+Usage: media $label <subcommand>
 
   list                    List all books in Readarr
   search <term>           Online search (via Readarr metadata lookup)
@@ -1569,20 +1574,50 @@ Usage: media audiobooks <subcommand>
   missing                 Monitored books not yet downloaded
   remove <term>           Remove a book by title/author substring (keeps files)
 
-Config:
-  READARR_URL, READARR_KEY             Readarr instance
-  DEFAULT_AUDIOBOOK_ROOT               Root folder path for new books
-  DEFAULT_AUDIOBOOK_QUALITY            Quality profile id (2 = Spoken, 1 = eBook)
-  DEFAULT_AUDIOBOOK_METADATA           Metadata profile id (1 = Standard)
+Instance config (audiobooks vs ebooks):
+  READARR_URL / READARR_KEY                      Audiobooks instance
+  READARR_EBOOKS_URL / READARR_EBOOKS_KEY        Ebooks instance
+  DEFAULT_AUDIOBOOK_ROOT / DEFAULT_EBOOK_ROOT    Root folder paths
+  DEFAULT_AUDIOBOOK_QUALITY (2=Spoken)           Quality profile id
+  DEFAULT_EBOOK_QUALITY (1=eBook)                Quality profile id
+  DEFAULT_AUDIOBOOK_METADATA / DEFAULT_EBOOK_METADATA  Metadata profile id (1=Standard)
 EOF
             ;;
 
         *)
-            echo "Unknown audiobooks subcommand: $subcmd"
-            echo "Run 'media audiobooks help' for usage."
+            echo "Unknown $label subcommand: $subcmd"
+            echo "Run 'media $label help' for usage."
             return 1
             ;;
     esac
+}
+
+cmd_audiobooks() {
+    if [ -z "${READARR_URL:-}" ] || [ -z "${READARR_KEY:-}" ]; then
+        echo "❌ READARR_URL / READARR_KEY not configured. Run 'media setup' or edit the config."
+        return 1
+    fi
+    _cmd_readarr_books audiobooks \
+        "${READARR_URL}" "${READARR_KEY}" \
+        "${DEFAULT_AUDIOBOOK_ROOT:-}" \
+        "${DEFAULT_AUDIOBOOK_QUALITY:-2}" \
+        "${DEFAULT_AUDIOBOOK_METADATA:-1}" \
+        "False" \
+        "$@"
+}
+
+cmd_ebooks() {
+    if [ -z "${READARR_EBOOKS_URL:-}" ] || [ -z "${READARR_EBOOKS_KEY:-}" ]; then
+        echo "❌ READARR_EBOOKS_URL / READARR_EBOOKS_KEY not configured. Run 'media setup' or edit the config."
+        return 1
+    fi
+    _cmd_readarr_books ebooks \
+        "${READARR_EBOOKS_URL}" "${READARR_EBOOKS_KEY}" \
+        "${DEFAULT_EBOOK_ROOT:-}" \
+        "${DEFAULT_EBOOK_QUALITY:-1}" \
+        "${DEFAULT_EBOOK_METADATA:-1}" \
+        "True" \
+        "$@"
 }
 
 ### Unpackerr ###
@@ -1783,7 +1818,8 @@ LIBRARY:
   status                   Service health + library counts + active downloads
   movies list|search|add|remove|missing
   shows  list|search|add|remove
-  audiobooks list|search|add|remove|missing  (Readarr, Spoken profile)
+  audiobooks list|search|add|remove|missing  (Readarr 8787, Spoken profile)
+  ebooks     list|search|add|remove|missing  (Readarr 8788, eBook profile)
 
 DOWNLOADS:
   downloads [list|active|pause|resume|remove]
@@ -1854,6 +1890,7 @@ case "$cmd" in
     movies)           cmd_movies "$@" ;;
     shows)            cmd_shows "$@" ;;
     audiobooks|books) cmd_audiobooks "$@" ;;
+    ebooks|ebook)     cmd_ebooks "$@" ;;
     downloads|dl)     cmd_downloads "$@" ;;
     queue)            cmd_queue "$@" ;;
     wanted)           cmd_wanted "$@" ;;

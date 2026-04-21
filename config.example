@@ -43,6 +43,13 @@ TDARR_URL="http://localhost:8265"
 # RECYCLARR_BIN="C:/ProgramData/Recyclarr/recyclarr.exe"
 # RECYCLARR_CONFIG="C:/ProgramData/Recyclarr/recyclarr.yml"
 
+# Readarr (audiobooks instance). Port 8787 is the default.
+# READARR_URL="http://localhost:8787"
+# READARR_KEY=""
+# DEFAULT_AUDIOBOOK_ROOT="G:\\Audiobooks"
+# DEFAULT_AUDIOBOOK_QUALITY=2     # "Spoken" profile id (usually 2; eBook is 1)
+# DEFAULT_AUDIOBOOK_METADATA=1    # "Standard" metadata profile id
+
 # Defaults
 DEFAULT_MOVIE_QUALITY=4        # Quality profile ID (4 = HD-1080p typically)
 DEFAULT_SHOW_QUALITY=4

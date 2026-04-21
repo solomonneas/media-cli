@@ -32,11 +32,16 @@ _load_config() {
 _curl() {
     local url="$1"; shift
     local extra="${*:-}"
+    # $extra is a packed string like:  -H "X-Api-Key: abc"
+    # Running it through bash -c re-parses the embedded quotes the same way
+    # the SSH branch already does on the remote host. Running curl directly
+    # with $extra unquoted would word-split on whitespace and break the
+    # header value, silently producing 401s.
     if [[ "${MEDIA_HOST:-local}" == ssh:* ]]; then
         local host="${MEDIA_HOST#ssh:}"
         ssh "$host" "curl -sf --max-time 15 $extra \"$url\"" 2>/dev/null
     else
-        curl -sf --max-time 15 $extra "$url" 2>/dev/null
+        bash -c "curl -sf --max-time 15 $extra \"$url\"" 2>/dev/null
     fi
 }
 
@@ -92,6 +97,11 @@ _bazarr() {
 _jellyseerr() {
     local endpoint="$1"; shift
     _curl "${JELLYSEERR_URL}/api/v1/$endpoint" "-H \"X-Api-Key: $JELLYSEERR_KEY\"" "$@"
+}
+
+_readarr() {
+    local endpoint="$1"; shift
+    _curl "${READARR_URL}/api/v1/$endpoint" "-H \"X-Api-Key: $READARR_KEY\"" "$@"
 }
 
 # Run the local (or remote) recyclarr binary with the given args. Output
@@ -1307,6 +1317,197 @@ print('endpoint for that was removed in Tdarr v2.63.')
     esac
 }
 
+### Audiobooks (Readarr) ###
+# Readarr powers the audiobooks namespace. When Readarr is used as an ebooks
+# instance too, point READARR_URL at a different instance and swap the default
+# quality profile (1 = eBook, 2 = Spoken).
+cmd_audiobooks() {
+    local subcmd="${1:-list}"; shift 2>/dev/null || true
+    if [ -z "${READARR_URL:-}" ] || [ -z "${READARR_KEY:-}" ]; then
+        echo "❌ READARR_URL / READARR_KEY not configured. Run 'media setup' or edit the config."
+        return 1
+    fi
+
+    case "$subcmd" in
+        list|ls)
+            _readarr "book" | python3 -c "
+import sys, json
+books = json.load(sys.stdin) or []
+def sort_key(b):
+    a = (b.get('author') or {}).get('authorName','') or ''
+    return (a.lower(), (b.get('title','') or '').lower())
+for b in sorted(books, key=sort_key):
+    author = (b.get('author') or {}).get('authorName','?')
+    title  = b.get('title','?')
+    stats  = b.get('statistics',{}) or {}
+    has_file = (stats.get('bookFileCount',0) or 0) > 0
+    icon = '✅' if has_file else '⏳'
+    print(f'{icon} {author} - {title}')
+print(f'\nTotal: {len(books)} books')
+" 2>/dev/null
+            ;;
+
+        search)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media audiobooks search <title or author>"; return 1; }
+            local eq
+            eq=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
+            _readarr "book/lookup?term=$eq" | python3 -c "
+import sys, json
+results = (json.load(sys.stdin) or [])[:10]
+for r in results:
+    author = (r.get('author') or {}).get('authorName','?')
+    title  = r.get('title','?')
+    year   = (r.get('releaseDate') or '')[:4] or '?'
+    gr     = r.get('foreignBookId','?')
+    added  = '➕' if r.get('id') else ''
+    print(f'{added} [{gr}] {author} - {title} ({year})')
+if not results: print('No results found.')
+" 2>/dev/null
+            ;;
+
+        add)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media audiobooks add <title or author>"; return 1; }
+            local eq
+            eq=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query")
+            local lookup payload
+            lookup=$(_readarr "book/lookup?term=$eq")
+            payload=$(echo "$lookup" | python3 -c "
+import sys, json, os
+results = json.load(sys.stdin) or []
+if not results:
+    print('ERROR:No results found'); sys.exit(0)
+r = results[0]
+if r.get('id'):
+    print(f'EXISTING:{r.get(\"title\",\"?\")} (already in library)'); sys.exit(0)
+
+qp = int(os.environ.get('ARRCLI_QP','2'))
+mp = int(os.environ.get('ARRCLI_MP','1'))
+root = os.environ.get('ARRCLI_ROOT','')
+
+author = r.get('author') or {}
+author_payload = {
+    'authorName':       author.get('authorName','?'),
+    'foreignAuthorId':  author.get('foreignAuthorId',''),
+    'titleSlug':        author.get('titleSlug',''),
+    'qualityProfileId': qp,
+    'metadataProfileId':mp,
+    'rootFolderPath':   root,
+    'monitored':        True,
+    'monitorNewItems':  'all',
+    'addOptions':       {'monitor':'all','searchForMissingBooks': True},
+    'images':           author.get('images',[]),
+    'links':            author.get('links',[]),
+}
+book_payload = {
+    'title':          r.get('title','?'),
+    'foreignBookId':  r.get('foreignBookId',''),
+    'titleSlug':      r.get('titleSlug',''),
+    'editions':       r.get('editions',[]),
+    'images':         r.get('images',[]),
+    'releaseDate':    r.get('releaseDate',''),
+    'monitored':      True,
+    'author':         author_payload,
+    'addOptions':     {'searchForNewBook': True},
+}
+print('ADD:' + json.dumps(book_payload))
+" ARRCLI_QP="${DEFAULT_AUDIOBOOK_QUALITY:-2}" \
+  ARRCLI_MP="${DEFAULT_AUDIOBOOK_METADATA:-1}" \
+  ARRCLI_ROOT="${DEFAULT_AUDIOBOOK_ROOT:-}" 2>/dev/null)
+            case "$payload" in
+                ERROR:*) echo "${payload#ERROR:}"; return 1 ;;
+                EXISTING:*) echo "${payload#EXISTING:}" ;;
+                ADD:*)
+                    local json_data="${payload#ADD:}"
+                    _curl_post "${READARR_URL}/api/v1/book" "$json_data" "$READARR_KEY" | python3 -c "
+import sys, json
+try:
+    r = json.load(sys.stdin)
+    author = (r.get('author') or {}).get('authorName','?')
+    print(f'✅ Added: {author} - {r.get(\"title\",\"?\")} - Searching for downloads...')
+except Exception:
+    print('✅ Added book - searching for downloads...')
+" 2>/dev/null
+                    ;;
+            esac
+            ;;
+
+        missing)
+            _readarr "book" | python3 -c "
+import sys, json
+books = json.load(sys.stdin) or []
+missing = []
+for b in books:
+    if not b.get('monitored'): continue
+    stats = b.get('statistics',{}) or {}
+    if (stats.get('bookFileCount',0) or 0) > 0: continue
+    missing.append(b)
+missing.sort(key=lambda b: ((b.get('author') or {}).get('authorName','').lower(), b.get('title','').lower()))
+for b in missing:
+    author = (b.get('author') or {}).get('authorName','?')
+    print(f'⏳ {author} - {b.get(\"title\",\"?\")}')
+print(f'\nMissing: {len(missing)} / {len(books)} total')
+" 2>/dev/null
+            ;;
+
+        remove|rm)
+            local query="$*"
+            [ -z "$query" ] && { echo "Usage: media audiobooks remove <title>"; return 1; }
+            local books
+            books=$(_readarr "book")
+            echo "$books" | python3 -c "
+import sys, json
+query = '''$query'''.lower()
+books = json.load(sys.stdin) or []
+hits = [b for b in books if query in (b.get('title','').lower()) or query in ((b.get('author') or {}).get('authorName','').lower())]
+if not hits: print('ERROR:No match'); sys.exit(0)
+if len(hits) > 1:
+    for b in hits:
+        a = (b.get('author') or {}).get('authorName','?')
+        print(f'MULTI:{b[\"id\"]}: {a} - {b.get(\"title\",\"?\")}')
+else:
+    b = hits[0]
+    a = (b.get('author') or {}).get('authorName','?')
+    print(f'REMOVE:{b[\"id\"]}:{a} - {b.get(\"title\",\"?\")}')
+" 2>/dev/null | while IFS= read -r line; do
+                case "$line" in
+                    ERROR:*) echo "${line#ERROR:}" ;;
+                    MULTI:*) echo "Multiple matches: ${line#MULTI:}" ;;
+                    REMOVE:*)
+                        local id="${line#REMOVE:}"; id="${id%%:*}"; local name="${line#*:*:}"
+                        _curl "${READARR_URL}/api/v1/book/$id?deleteFiles=false" "-X DELETE -H \"X-Api-Key: $READARR_KEY\"" >/dev/null
+                        echo "🗑️ Removed: $name (files kept)" ;;
+                esac
+            done
+            ;;
+
+        help|--help|-h)
+            cat <<'EOF'
+Usage: media audiobooks <subcommand>
+
+  list                    List all books in Readarr
+  search <term>           Online search (via Readarr metadata lookup)
+  add <term>              Add the top search hit (creates author if needed)
+  missing                 Monitored books not yet downloaded
+  remove <term>           Remove a book by title/author substring (keeps files)
+
+Config:
+  READARR_URL, READARR_KEY             Readarr instance
+  DEFAULT_AUDIOBOOK_ROOT               Root folder path for new books
+  DEFAULT_AUDIOBOOK_QUALITY            Quality profile id (2 = Spoken, 1 = eBook)
+  DEFAULT_AUDIOBOOK_METADATA           Metadata profile id (1 = Standard)
+EOF
+            ;;
+
+        *)
+            echo "Unknown audiobooks subcommand: $subcmd"
+            echo "Run 'media audiobooks help' for usage."
+            return 1
+            ;;
+    esac
+}
+
 ### Unpackerr ###
 # Unpackerr extracts rar'd releases on behalf of Sonarr/Radarr so they can
 # import them. It has no HTTP API in its default config, so this reads the
@@ -1505,6 +1706,7 @@ LIBRARY:
   status                   Service health + library counts + active downloads
   movies list|search|add|remove|missing
   shows  list|search|add|remove
+  audiobooks list|search|add|remove|missing  (Readarr, Spoken profile)
 
 DOWNLOADS:
   downloads [list|active|pause|resume|remove]
@@ -1574,6 +1776,7 @@ case "$cmd" in
     status)           cmd_status "$@" ;;
     movies)           cmd_movies "$@" ;;
     shows)            cmd_shows "$@" ;;
+    audiobooks|books) cmd_audiobooks "$@" ;;
     downloads|dl)     cmd_downloads "$@" ;;
     queue)            cmd_queue "$@" ;;
     wanted)           cmd_wanted "$@" ;;

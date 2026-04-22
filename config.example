@@ -66,6 +66,17 @@ TDARR_URL="http://localhost:8265"
 # DEFAULT_MUSIC_QUALITY=1         # "Any" profile id (Lossless=2, Standard=3)
 # DEFAULT_MUSIC_METADATA=1        # "Standard" metadata profile id
 
+# Hunt (Huntarr replacement). Fires targeted missing-item search commands
+# on a rate-limited cadence. Huntarr upstream was taken down 2026-02 over
+# unpatched security issues; this reimplementation stays inside the *arr
+# APIs we already trust.
+# HUNT_ENABLED_APPS="sonarr radarr music audiobooks ebooks"
+# HUNT_MISSING_PER_CYCLE=5         # Items hunted per app per cycle
+# HUNT_API_DELAY_SECONDS=10        # Sleep between apps in the same cycle
+# HUNT_MIN_INTERVAL_MINUTES=30     # Per-app cooldown between cycles
+# HUNT_FETCH_PAGE_SIZE=200         # First-page size for the random sample
+# HUNT_STATE_FILE="C:/ProgramData/arr-cli/hunt-state.json"
+
 # Defaults
 DEFAULT_MOVIE_QUALITY=4        # Quality profile ID (4 = HD-1080p typically)
 DEFAULT_SHOW_QUALITY=4

@@ -784,6 +784,270 @@ EOF
     esac
 }
 
+### Hunt (Huntarr replacement) ###
+# Native replacement for Huntarr - the upstream project was taken down after
+# its author refused to address security disclosures. Fires targeted search
+# commands at each *arr on a rate-limited schedule so indexers aren't
+# hammered. Runs one "cycle" per invocation; a scheduled task drives
+# recurring cycles.
+#
+# State lives in HUNT_STATE_FILE (JSON). Keys: last_run[app], last_count[app],
+# total[app]. Cooldown prevents back-to-back cycles from a manual trigger.
+
+_hunt_state_file() {
+    echo "${HUNT_STATE_FILE:-C:/ProgramData/arr-cli/hunt-state.json}"
+}
+
+_hunt_apps_enabled() {
+    # Default set covers every *arr this CLI knows about.
+    echo "${HUNT_ENABLED_APPS:-sonarr radarr music audiobooks ebooks}"
+}
+
+# Print "URL|KEY|API_VERSION|SEARCH_CMD|ID_KEY" for the given app, or "" if
+# the app is unknown or not configured.
+_hunt_app_config() {
+    case "$1" in
+        sonarr)     echo "${SONARR_URL:-}|${SONARR_KEY:-}|v3|EpisodeSearch|episodeIds" ;;
+        radarr)     echo "${RADARR_URL:-}|${RADARR_KEY:-}|v3|MoviesSearch|movieIds" ;;
+        music)      echo "${LIDARR_URL:-}|${LIDARR_KEY:-}|v1|AlbumSearch|albumIds" ;;
+        audiobooks) echo "${READARR_URL:-}|${READARR_KEY:-}|v1|BookSearch|bookIds" ;;
+        ebooks)     echo "${READARR_EBOOKS_URL:-}|${READARR_EBOOKS_KEY:-}|v1|BookSearch|bookIds" ;;
+        *)          echo "" ;;
+    esac
+}
+
+# Fetch missing items for an app and print JSON {"total": N, "ids": [...]}.
+# Pulls a single page sized HUNT_FETCH_PAGE_SIZE (default 200) and lets the
+# Python side random-sample from it — hitting /wanted/missing?pageSize=5000
+# is slow and unnecessary when we only hunt a handful per cycle.
+_hunt_fetch_missing() {
+    local app="$1"
+    local cfg; cfg=$(_hunt_app_config "$app")
+    [ -z "$cfg" ] && return 1
+    local url="${cfg%%|*}"; local rest="${cfg#*|}"
+    local key="${rest%%|*}"; rest="${rest#*|}"
+    local api="${rest%%|*}"
+    [ -z "$url" ] || [ -z "$key" ] && return 1
+
+    local pagesize="${HUNT_FETCH_PAGE_SIZE:-200}"
+    local resp
+    resp=$(_curl "${url}/api/${api}/wanted/missing?pageSize=${pagesize}&page=1" "-H \"X-Api-Key: $key\"")
+    [ -z "$resp" ] && return 1
+
+    ARRCLI_HUNT_RESP="$resp" python3 -c "
+import os, json
+d = json.loads(os.environ.get('ARRCLI_HUNT_RESP') or '{}')
+ids = [r.get('id') for r in (d.get('records') or []) if r.get('id')]
+print(json.dumps({'total': d.get('totalRecords', len(ids)), 'ids': ids}))
+" 2>/dev/null
+}
+
+# Pick N random IDs from the JSON pool (stdin). Output: space-separated IDs.
+_hunt_pick_ids() {
+    local n="$1"
+    ARRCLI_HUNT_N="$n" python3 -c "
+import os, sys, json, random
+pool = json.load(sys.stdin).get('ids') or []
+n = int(os.environ.get('ARRCLI_HUNT_N','5'))
+picked = random.sample(pool, min(n, len(pool))) if pool else []
+print(' '.join(str(i) for i in picked))
+" 2>/dev/null
+}
+
+# POST the search command with the given IDs to the app's /command endpoint.
+# Echoes the queued command id on success, empty on failure.
+_hunt_trigger() {
+    local app="$1"; shift
+    local cfg; cfg=$(_hunt_app_config "$app")
+    [ -z "$cfg" ] && return 1
+    local url="${cfg%%|*}"; local rest="${cfg#*|}"
+    local key="${rest%%|*}"; rest="${rest#*|}"
+    local api="${rest%%|*}"; rest="${rest#*|}"
+    local cmd="${rest%%|*}"; local id_key="${rest#*|}"
+
+    local ids_json
+    ids_json=$(CMD="$cmd" ID_KEY="$id_key" python3 -c "
+import os, sys, json
+ids = [int(x) for x in sys.argv[1:] if x.strip().lstrip('-').isdigit()]
+print(json.dumps({'name': os.environ['CMD'], os.environ['ID_KEY']: ids}))
+" "$@" 2>/dev/null)
+    [ -z "$ids_json" ] && return 1
+
+    _curl_post "${url}/api/${api}/command" "$ids_json" "$key" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    if isinstance(d, dict) and d.get('id'):
+        print(d['id'])
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+# Read+write the state file. Missing file -> empty object. Atomic-ish rename
+# would be nice but bash+Windows complicates that; a direct overwrite is fine
+# here since we're single-writer.
+_hunt_state_read() {
+    local f; f=$(_hunt_state_file)
+    if [ -f "$f" ]; then cat "$f"; else echo '{}'; fi
+}
+
+_hunt_state_update() {
+    # stdin = JSON patch {"app":"sonarr","hunted":5}
+    local f; f=$(_hunt_state_file)
+    local dir; dir="$(dirname "$f")"
+    [ -d "$dir" ] || mkdir -p "$dir"
+    local prev; prev=$(_hunt_state_read)
+    PREV="$prev" PATCH="$(cat)" python3 -c "
+import os, json, time
+s = json.loads(os.environ.get('PREV') or '{}')
+p = json.loads(os.environ.get('PATCH') or '{}')
+app = p['app']
+now = int(time.time())
+s.setdefault('last_run', {})[app] = now
+s.setdefault('last_count', {})[app] = p.get('hunted', 0)
+s.setdefault('total', {})[app] = (s.get('total', {}).get(app, 0) or 0) + p.get('hunted', 0)
+print(json.dumps(s, indent=2))
+" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+}
+
+_hunt_cooldown_ok() {
+    # Returns 0 when the app's last_run is far enough in the past.
+    local app="$1"
+    local minutes="${HUNT_MIN_INTERVAL_MINUTES:-30}"
+    _hunt_state_read | APP="$app" MIN="$minutes" python3 -c "
+import os, sys, json, time
+s = json.load(sys.stdin)
+app = os.environ['APP']; mins = int(os.environ['MIN'])
+last = (s.get('last_run') or {}).get(app, 0)
+sys.exit(0 if (time.time() - last) >= mins*60 else 1)
+"
+}
+
+cmd_hunt() {
+    local subcmd="${1:-run}"; shift 2>/dev/null || true
+    local per_cycle="${HUNT_MISSING_PER_CYCLE:-5}"
+    local api_delay="${HUNT_API_DELAY_SECONDS:-10}"
+
+    case "$subcmd" in
+        run)
+            local only="${1:-}"
+            local apps; apps=$(_hunt_apps_enabled)
+            [ -n "$only" ] && apps="$only"
+            local any=0
+            for app in $apps; do
+                if ! _hunt_cooldown_ok "$app"; then
+                    echo "⏸️  $app: cooldown (min ${HUNT_MIN_INTERVAL_MINUTES:-30} min between cycles)"
+                    continue
+                fi
+                local pool; pool=$(_hunt_fetch_missing "$app")
+                if [ -z "$pool" ]; then
+                    echo "⚠️  $app: not configured or unreachable"
+                    continue
+                fi
+                local total; total=$(echo "$pool" | python3 -c "import sys,json;print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+                if [ "${total:-0}" = "0" ]; then
+                    echo "✅ $app: nothing missing"
+                    continue
+                fi
+                local ids; ids=$(echo "$pool" | _hunt_pick_ids "$per_cycle")
+                if [ -z "$ids" ]; then
+                    echo "⚠️  $app: missing=$total but id pool empty (check API response)"
+                    continue
+                fi
+                local id_count; id_count=$(echo "$ids" | wc -w)
+                local cmdid; cmdid=$(_hunt_trigger "$app" $ids)
+                if [ -n "$cmdid" ]; then
+                    echo "🎯 $app: queued search for $id_count item(s) (cmd=$cmdid, $total still missing)"
+                    echo '{"app":"'"$app"'","hunted":'"$id_count"'}' | _hunt_state_update
+                    any=1
+                else
+                    echo "❌ $app: search command failed"
+                fi
+                sleep "$api_delay"
+            done
+            [ "$any" = "0" ] && echo "(no cycles fired this run)"
+            ;;
+
+        status)
+            echo "Hunt state: $(_hunt_state_file)"
+            echo
+            _hunt_state_read | python3 -c "
+import sys, json, time
+s = json.load(sys.stdin)
+last = s.get('last_run') or {}
+cnt  = s.get('last_count') or {}
+tot  = s.get('total') or {}
+apps = sorted(set(list(last.keys()) + list(cnt.keys()) + list(tot.keys())))
+if not apps:
+    print('(no cycles recorded yet)'); raise SystemExit
+now = int(time.time())
+print(f'{\"app\":<12} {\"last_run\":<22} {\"mins_ago\":>8} {\"last_count\":>11} {\"total\":>8}')
+for a in apps:
+    lr = last.get(a, 0) or 0
+    age = 'never' if lr == 0 else f'{(now-lr)//60}'
+    when = '(never)' if lr == 0 else time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(lr))
+    print(f'{a:<12} {when:<22} {age:>8} {cnt.get(a,0):>11} {tot.get(a,0):>8}')
+" 2>/dev/null
+            ;;
+
+        missing)
+            # Dry-run preview: totals per app, no API writes.
+            local apps; apps=$(_hunt_apps_enabled)
+            for app in $apps; do
+                local pool; pool=$(_hunt_fetch_missing "$app")
+                if [ -z "$pool" ]; then
+                    printf '  %-12s (not configured or unreachable)\n' "$app"
+                    continue
+                fi
+                local total; total=$(echo "$pool" | python3 -c "import sys,json;print(json.load(sys.stdin).get('total',0))" 2>/dev/null)
+                printf '  %-12s %s missing\n' "$app" "${total:-?}"
+            done
+            ;;
+
+        config)
+            cat <<EOF
+Enabled apps     : $(_hunt_apps_enabled)
+Per-cycle limit  : ${HUNT_MISSING_PER_CYCLE:-5} items per app per cycle
+API delay        : ${HUNT_API_DELAY_SECONDS:-10}s between apps
+Min interval     : ${HUNT_MIN_INTERVAL_MINUTES:-30} minutes between cycles per app
+Fetch page size  : ${HUNT_FETCH_PAGE_SIZE:-200} items sampled for random pick
+State file       : $(_hunt_state_file)
+EOF
+            ;;
+
+        help|--help|-h)
+            cat <<'EOF'
+Usage: media hunt <subcommand>
+
+  run [app]     Fire one hunt cycle (all enabled apps, or one: sonarr|
+                radarr|music|audiobooks|ebooks). Respects cooldown.
+  status        Per-app last-run time, items hunted, running totals.
+  missing       Dry-run: missing count per app, no API writes.
+  config        Active configuration.
+
+Native replacement for Huntarr (upstream taken down 2026-02 over
+unpatched security issues). Rate-limits targeted search commands so
+indexers aren't hammered.
+
+Config:
+  HUNT_ENABLED_APPS             Default: "sonarr radarr music audiobooks ebooks"
+  HUNT_MISSING_PER_CYCLE        Default: 5
+  HUNT_API_DELAY_SECONDS        Default: 10
+  HUNT_MIN_INTERVAL_MINUTES     Default: 30
+  HUNT_FETCH_PAGE_SIZE          Default: 200
+  HUNT_STATE_FILE               Default: C:/ProgramData/arr-cli/hunt-state.json
+EOF
+            ;;
+
+        *)
+            echo "Unknown hunt subcommand: $subcmd"
+            echo "Run 'media hunt help' for usage."
+            return 1
+            ;;
+    esac
+}
+
 cmd_downloads() {
     local subcmd="${1:-list}"; shift 2>/dev/null || true
     case "$subcmd" in
@@ -2000,6 +2264,9 @@ LIBRARY:
   ebooks     list|search|add|remove|missing  (Readarr 8788, eBook profile)
   music      list|search|add|remove|missing  (Lidarr 8686, artist-first)
 
+HUNT (Huntarr replacement):
+  hunt [run|status|missing|config]  Rate-limited missing-item searches
+
 DOWNLOADS:
   downloads [list|active|pause|resume|remove]
   queue                    Sonarr/Radarr download queues
@@ -2071,6 +2338,7 @@ case "$cmd" in
     audiobooks|books) cmd_audiobooks "$@" ;;
     ebooks|ebook)     cmd_ebooks "$@" ;;
     music|artists)    cmd_music "$@" ;;
+    hunt)             cmd_hunt "$@" ;;
     downloads|dl)     cmd_downloads "$@" ;;
     queue)            cmd_queue "$@" ;;
     wanted)           cmd_wanted "$@" ;;

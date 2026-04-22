@@ -736,9 +736,11 @@ print(f'\nMissing: {len(missing)} / {len(albums)} monitored albums')
         remove|rm)
             local query="$*"
             [ -z "$query" ] && { echo "Usage: media music remove <artist>"; return 1; }
-            _lidarr "artist" | python3 -c "
-import sys, json
-query = '''$query'''.lower()
+            # Query goes through an env var to survive apostrophes ("Guns N' Roses")
+            # and anything else that would break triple-quoted string embedding.
+            _lidarr "artist" | ARRCLI_QUERY="$query" python3 -c "
+import os, sys, json
+query = os.environ.get('ARRCLI_QUERY','').lower()
 hits = [a for a in (json.load(sys.stdin) or []) if query in a.get('artistName','').lower()]
 if not hits: print('ERROR:No match'); sys.exit(0)
 if len(hits) > 1:
@@ -934,6 +936,21 @@ cmd_hunt() {
             local only="${1:-}"
             local apps; apps=$(_hunt_apps_enabled)
             [ -n "$only" ] && apps="$only"
+            # Whole-cycle lock: a scheduled HuntCycle can overlap a manual run,
+            # or a slow previous cycle can still be in flight when the next
+            # tick fires. Without a lock, both processes pass cooldown, both
+            # queue duplicate searches, and one's state write clobbers the
+            # other's. mkdir is an atomic create on Windows and POSIX.
+            local lock_dir; lock_dir="$(dirname "$(_hunt_state_file)")/hunt.lock"
+            if ! mkdir "$lock_dir" 2>/dev/null; then
+                echo "⏸️  another hunt cycle is running (lock: $lock_dir). Skipping."
+                echo "   If the previous run crashed, remove the lock manually."
+                return 0
+            fi
+            # Trap is double-quoted so $lock_dir expands at trap-set time — by
+            # the time EXIT fires, `local lock_dir` is out of scope and `set -u`
+            # would blow up on deferred expansion.
+            trap "rmdir \"$lock_dir\" 2>/dev/null" EXIT
             local any=0
             for app in $apps; do
                 if ! _hunt_cooldown_ok "$app"; then
@@ -1978,22 +1995,27 @@ print(f'\nMissing: {len(missing)} / {len(books)} total')
         remove|rm)
             local query="$*"
             [ -z "$query" ] && { echo "Usage: media $label remove <title>"; return 1; }
-            local books
+            # Readarr's /book response has authorId but no embedded author
+            # object — must fetch /author separately to match on author name.
+            # Query passed via env var to survive apostrophes / backslashes.
+            local books authors
             books=$(_readarr_api "$url" "$key" "book")
-            echo "$books" | python3 -c "
-import sys, json
-query = '''$query'''.lower()
-books = json.load(sys.stdin) or []
-hits = [b for b in books if query in (b.get('title','').lower()) or query in ((b.get('author') or {}).get('authorName','').lower())]
-if not hits: print('ERROR:No match'); sys.exit(0)
-if len(hits) > 1:
+            authors=$(_readarr_api "$url" "$key" "author")
+            ARRCLI_BOOKS="$books" ARRCLI_AUTHORS="$authors" ARRCLI_QUERY="$query" python3 -c "
+import os, json
+query = os.environ.get('ARRCLI_QUERY','').lower()
+books   = json.loads(os.environ.get('ARRCLI_BOOKS') or '[]')
+authors = json.loads(os.environ.get('ARRCLI_AUTHORS') or '[]')
+names = {a.get('id'): (a.get('authorName') or '') for a in authors}
+def author_of(b): return names.get(b.get('authorId'), '')
+hits = [b for b in books if query in (b.get('title','').lower()) or query in author_of(b).lower()]
+if not hits: print('ERROR:No match')
+elif len(hits) > 1:
     for b in hits:
-        a = (b.get('author') or {}).get('authorName','?')
-        print(f'MULTI:{b[\"id\"]}: {a} - {b.get(\"title\",\"?\")}')
+        print(f'MULTI:{b[\"id\"]}: {author_of(b) or \"?\"} - {b.get(\"title\",\"?\")}')
 else:
     b = hits[0]
-    a = (b.get('author') or {}).get('authorName','?')
-    print(f'REMOVE:{b[\"id\"]}:{a} - {b.get(\"title\",\"?\")}')
+    print(f'REMOVE:{b[\"id\"]}:{author_of(b) or \"?\"} - {b.get(\"title\",\"?\")}')
 " 2>/dev/null | while IFS= read -r line; do
                 case "$line" in
                     ERROR:*) echo "${line#ERROR:}" ;;

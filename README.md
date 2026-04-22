@@ -1,19 +1,19 @@
 <p align="center">
-  <img src="assets/pirate.svg" alt="arr-cli treasure chest" width="180" />
+  <img src="assets/tv.svg" alt="media-cli" width="180" />
 </p>
 
 <p align="center">
-  <h1 align="center">🏴‍☠️ arr-cli</h1>
+  <h1 align="center">📺 media-cli</h1>
   <p align="center">
-    Plunder your *arr media stack from the terminal. One bash script, no runtime, works locally or over SSH.
+    Drive your self-hosted media stack from the terminal. One bash script, no runtime, works locally or over SSH.
     <br />
     <strong>Sonarr · Radarr · Prowlarr · qBittorrent · Bazarr · Jellyseerr · Tdarr</strong>
   </p>
 </p>
 
 <p align="center">
-  <a href="https://github.com/solomonneas/arr-cli/actions/workflows/ci.yml"><img src="https://github.com/solomonneas/arr-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://www.npmjs.com/package/arr-cli"><img src="https://img.shields.io/npm/v/arr-cli.svg" alt="npm"></a>
+  <a href="https://github.com/solomonneas/media-cli/actions/workflows/ci.yml"><img src="https://github.com/solomonneas/media-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.npmjs.com/package/media-cli"><img src="https://img.shields.io/npm/v/media-cli.svg" alt="npm"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/shell-bash-green.svg" alt="Bash">
 </p>
@@ -29,13 +29,13 @@
 
 ---
 
-**arr-cli** is a single bash script that wraps the APIs of your entire media automation stack into simple, memorable commands. No Docker, no Node, no Python packages. Just `curl`, `python3` (stdlib only), and your existing *arr setup.
+**media-cli** is a single bash script that wraps the APIs of your entire media automation stack into simple, memorable commands. No Docker, no Node, no Python packages. Just `curl`, `python3` (stdlib only), and your existing *arr setup.
 
 Built for humans who manage media servers from the terminal, and for AI agents that do it on their behalf.
 
-**Playback server?** arr-cli handles acquisition (Sonarr/Radarr/qBittorrent/Tdarr). For controlling Jellyfin itself — playback sessions, library scans, user management, scheduled tasks — see [**jellyfin-mcp**](https://github.com/solomonneas/jellyfin-mcp), the companion MCP server.
+**Playback server?** media-cli handles acquisition (Sonarr/Radarr/qBittorrent/Tdarr). For controlling Jellyfin itself (playback sessions, library scans, user management, scheduled tasks), see [**jellyfin-mcp**](https://github.com/solomonneas/jellyfin-mcp), the companion MCP server.
 
-> Formerly `media-cli`. Old GitHub URL still redirects. The binary is still named `media` (also installed as `arr-cli`), and the config path stays at `~/.config/media-cli/` for back-compat.
+> Briefly shipped as `arr-cli`. The old GitHub URL still redirects, the `arr-cli` npm package stays installable, and the binary has always been `media`.
 
 ```bash
 $ media movies search "Interstellar"
@@ -74,22 +74,22 @@ $ media downloads active
 **npm (recommended):**
 
 ```bash
-npm install -g arr-cli
+npm install -g media-cli
 ```
 
-Exposes both `arr-cli` and `media` on your `PATH`.
+Exposes both `media` and `media-cli` on your `PATH`.
 
 **One-liner (no npm):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/solomonneas/arr-cli/main/media -o ~/bin/media && chmod +x ~/bin/media
+curl -fsSL https://raw.githubusercontent.com/solomonneas/media-cli/main/media -o ~/bin/media && chmod +x ~/bin/media
 ```
 
 **Clone:**
 
 ```bash
-git clone https://github.com/solomonneas/arr-cli.git
-cd arr-cli
+git clone https://github.com/solomonneas/media-cli.git
+cd media-cli
 bash install.sh
 ```
 
@@ -268,7 +268,7 @@ This is the killer feature for headless servers. Your services don't need to be 
 
 This CLI was built alongside [OpenClaw](https://openclaw.ai), an AI agent platform. The commands are designed to be easily parsed by AI assistants.
 
-Any AI agent or automation tool that can run shell commands can use arr-cli:
+Any AI agent or automation tool that can run shell commands can use media-cli:
 
 **Natural language to commands:**
 
@@ -298,7 +298,7 @@ Works with OpenClaw, LangChain tool calling, Claude computer use, or any agent f
 
 ```
                        ┌──────────────┐
-                       │   arr-cli    │
+                       │  media-cli   │
                        │  (your box)  │
                        └──────┬───────┘
                               │  curl (over SSH, optional)
@@ -335,7 +335,7 @@ Works with OpenClaw, LangChain tool calling, Claude computer use, or any agent f
 
 Poisoned `*arr` releases are a real thing. In April 2026 a wave of them shipped LummaStealer-class payloads as fake video-named `.exe` / `.scr` files inside releases for popular shows. Legit video releases do not contain executables.
 
-arr-cli ships a one-command hardening layer that sets qBittorrent's global `excluded_file_names` preference so these files never hit disk:
+media-cli ships a one-command hardening layer that sets qBittorrent's global `excluded_file_names` preference so these files never hit disk:
 
 ```bash
 media qbit harden on        # Enabled by default after `media setup`
@@ -361,7 +361,7 @@ QBIT_HARDEN_EXTRAS="*.exe *.bat" media qbit harden on
 1. **Windows Defender exclusions + real-time scanning on your downloads directory.** Don't disable Defender for your whole drive; just exclude the specific legit-but-false-positive paths you know about.
 2. **qB autorun hook that deletes executables in media-category torrents only.** qBittorrent can run a command "on torrent completed" — point it at a script that walks the completed torrent and deletes any executables if the category is your Sonarr/Radarr category. That way manual downloads in other categories aren't touched.
 
-arr-cli doesn't automate these two — they're host-OS-specific and the right paths/categories depend on your setup. The CLI handles the one layer that's cleanly API-addressable across platforms (qBittorrent's own preference).
+media-cli doesn't automate these two - they're host-OS-specific and the right paths/categories depend on your setup. The CLI handles the one layer that's cleanly API-addressable across platforms (qBittorrent's own preference).
 
 **Preserves your existing exclusions.** `harden on` merges our patterns into whatever `excluded_file_names` list qBittorrent already has; your custom exclusions survive. `harden off` removes *only* our patterns, leaving yours intact. The feature toggle flips off only if nothing user-authored remains.
 
@@ -369,7 +369,7 @@ arr-cli doesn't automate these two — they're host-OS-specific and the right pa
 
 Most *arr services shipped as Windows scheduled tasks pop a console window on boot or on every scheduled run, because Task Scheduler launches them in the user's interactive session. PowerShell's `-WindowStyle Hidden` still flashes briefly; the only truly flash-free path is to route the action through `wscript.exe`, which is a GUI-subsystem binary and never opens a console.
 
-arr-cli ships `assets/launch-hidden.vbs` and `scripts/hide-task-popups.ps1` for this. The VBS re-emits the target command line with `WshShell.Run showStyle=0` (SW_HIDE), and the retrofit script rewrites existing scheduled tasks to invoke the VBS instead of the target exe directly.
+media-cli ships `assets/launch-hidden.vbs` and `scripts/hide-task-popups.ps1` for this. The VBS re-emits the target command line with `WshShell.Run showStyle=0` (SW_HIDE), and the retrofit script rewrites existing scheduled tasks to invoke the VBS instead of the target exe directly.
 
 ```powershell
 # Dry-run the curated default set (all *arr + common support services)

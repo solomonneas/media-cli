@@ -8,7 +8,7 @@ Contributions welcome. If you're picking something up, open an issue first so we
 
 ### Notifiarr
 
-Notification hub with a Discord focus. Two shapes from arr-cli:
+Notification hub with a Discord focus. Two shapes from media-cli:
 
 1. Read: pull recent notifications across all *arrs in one feed.
 2. Write: send ad-hoc notifications from scripts.
@@ -26,7 +26,7 @@ For clarity, things that get asked about but won't land here:
 
 - **Profilarr** - Recyclarr already syncs TRaSH-guide custom formats and quality profiles. Profilarr is the same job with a different distribution model. One is enough.
 - **Ombi** - Jellyseerr is already covered; Ombi would be a duplicate surface.
-- **Sabnzbd / NZBGet** - arr-cli is torrent-first by design. A `media usenet` namespace could happen if there's real demand, but it's not on the roadmap today.
+- **Sabnzbd / NZBGet** - media-cli is torrent-first by design. A `media usenet` namespace could happen if there's real demand, but it's not on the roadmap today.
 - **Plex** - See [jellyfin-mcp](https://github.com/solomonneas/jellyfin-mcp) for the playback side. Plex is out of scope.
 
 ## Already Shipped

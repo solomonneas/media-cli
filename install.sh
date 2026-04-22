@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# arr-cli installer
+# media-cli installer
 set -euo pipefail
 
 INSTALL_DIR="${1:-$HOME/bin}"
 
-echo "Installing arr-cli to $INSTALL_DIR..."
+echo "Installing media-cli to $INSTALL_DIR..."
 
 mkdir -p "$INSTALL_DIR"
 cp media "$INSTALL_DIR/media"

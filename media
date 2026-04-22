@@ -129,6 +129,13 @@ _mylar() {
     _curl "${MYLAR_URL}/api?apikey=${MYLAR_KEY}&cmd=${cmd}${extra}" ""
 }
 
+# Autobrr (IRC announce parser). Different auth shape again: X-API-Token
+# header, not X-Api-Key. Endpoints: /api/... REST + JSON.
+_autobrr() {
+    local endpoint="$1"; shift
+    _curl "${AUTOBRR_URL}/api/$endpoint" "-H \"X-API-Token: $AUTOBRR_KEY\"" "$@"
+}
+
 # Run the local (or remote) recyclarr binary with the given args. Output
 # streams straight back. Caller supplies any -c/--config flag explicitly;
 # cmd_recyclarr injects RECYCLARR_CONFIG for sync/list/delete (the
@@ -974,6 +981,135 @@ EOF
         *)
             echo "Unknown comics subcommand: $subcmd"
             echo "Run 'media comics help' for usage."
+            return 1
+            ;;
+    esac
+}
+
+# Autobrr wrapper. Read-only: writes (adding filters, IRC credentials) stay
+# in the web UI - too many edge cases to wrap in shell. In "preinstall"
+# posture with zero IRC networks, `status` reports the intentional baseline.
+cmd_autobrr() {
+    local subcmd="${1:-status}"; shift 2>/dev/null || true
+    if [ -z "${AUTOBRR_URL:-}" ] || [ -z "${AUTOBRR_KEY:-}" ]; then
+        echo "❌ AUTOBRR_URL / AUTOBRR_KEY not configured. Run 'media setup' or edit the config."
+        return 1
+    fi
+
+    case "$subcmd" in
+        status)
+            local cfg filters irc clients releases
+            cfg=$(_autobrr "config")
+            filters=$(_autobrr "filters")
+            irc=$(_autobrr "irc")
+            clients=$(_autobrr "download_clients")
+            releases=$(_autobrr "release?limit=1")
+            ARRCLI_CFG="$cfg" ARRCLI_FILTERS="$filters" ARRCLI_IRC="$irc" \
+            ARRCLI_CLIENTS="$clients" ARRCLI_RELEASES="$releases" python3 -c "
+import os, json
+def parse(name):
+    raw = os.environ.get('ARRCLI_' + name, '')
+    try: return json.loads(raw) if raw else None
+    except json.JSONDecodeError: return None
+cfg      = parse('CFG') or {}
+filters  = parse('FILTERS') or []
+irc      = parse('IRC') or []
+clients  = parse('CLIENTS') or []
+releases = parse('RELEASES') or {}
+version = cfg.get('version','?')
+print(f'Version:          Autobrr {version}')
+print(f'Host:             {cfg.get(\"host\",\"?\")}:{cfg.get(\"port\",\"?\")}')
+print(f'Filters:          {len(filters)} total, {sum(1 for f in filters if f.get(\"enabled\"))} enabled')
+print(f'Download clients: {len(clients)} total, {sum(1 for c in clients if c.get(\"enabled\"))} enabled')
+print(f'IRC networks:     {len(irc)}')
+if not irc:
+    print('                    (preinstall posture: 0 networks - add one via web UI)')
+else:
+    connected = sum(1 for n in irc if n.get('connected'))
+    print(f'                  {connected} connected')
+count = releases.get('count', 0) if isinstance(releases, dict) else 0
+print(f'Releases seen:    {count}')
+" 2>/dev/null
+            ;;
+
+        filters)
+            _autobrr "filters" | python3 -c "
+import sys, json
+for f in (json.load(sys.stdin) or []):
+    mark = '✅' if f.get('enabled') else '⏸️ '
+    name = f.get('name','?')
+    prio = f.get('priority',0)
+    acts = f.get('actions_enabled_count') or 0
+    idx  = len(f.get('indexers') or [])
+    print(f'{mark} [{f.get(\"id\")}] {name}  pri={prio} actions={acts} indexers={idx}')
+" 2>/dev/null
+            ;;
+
+        irc)
+            _autobrr "irc" | python3 -c "
+import sys, json
+nets = json.load(sys.stdin) or []
+if not nets:
+    print('(no IRC networks configured - add one via web UI)')
+for n in nets:
+    conn = '✅' if n.get('connected') else '❌'
+    name = n.get('name','?')
+    server = n.get('server','?')
+    port = n.get('port','?')
+    nick = n.get('nick','?')
+    chans = n.get('channels') or []
+    print(f'{conn} {name}  {nick}@{server}:{port}  channels={len(chans)}')
+" 2>/dev/null
+            ;;
+
+        clients)
+            _autobrr "download_clients" | python3 -c "
+import sys, json
+for c in (json.load(sys.stdin) or []):
+    mark = '✅' if c.get('enabled') else '⏸️ '
+    print(f'{mark} [{c.get(\"id\")}] {c.get(\"name\",\"?\")}  type={c.get(\"type\",\"?\")} host={c.get(\"host\",\"?\")}')
+" 2>/dev/null
+            ;;
+
+        releases|release)
+            local limit="${1:-20}"
+            _autobrr "release?limit=$limit" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+data = r.get('data') if isinstance(r, dict) else None
+data = data or []
+for rel in data:
+    name = rel.get('torrent_name') or rel.get('name','?')
+    indexer = rel.get('indexer','?')
+    ts = rel.get('timestamp','')
+    print(f'  {ts}  [{indexer}]  {name}')
+count = r.get('count', 0) if isinstance(r, dict) else 0
+print(f'\nTotal releases seen: {count}')
+" 2>/dev/null
+            ;;
+
+        help|--help|-h)
+            cat <<'EOF'
+Usage: media autobrr <subcommand>
+
+  status                   Version, filter/client/IRC counts, release total
+  filters                  List filters (id, enabled, priority, action count)
+  irc                      List IRC networks and connection state
+  clients                  List *arr download clients pointed at by filters
+  releases [limit]         Recent releases seen across all networks (default 20)
+
+Writes (creating filters, IRC networks, credentials) stay in the web UI.
+Preinstall posture: 0 IRC networks = 0 releases. Filters and *arr clients
+are preseeded and disabled, waiting for a private-tracker invite.
+
+Config:
+  AUTOBRR_URL, AUTOBRR_KEY       Autobrr instance (X-API-Token header auth)
+EOF
+            ;;
+
+        *)
+            echo "Unknown autobrr subcommand: $subcmd"
+            echo "Run 'media autobrr help' for usage."
             return 1
             ;;
     esac
@@ -2483,6 +2619,9 @@ LIBRARY:
 HUNT (Huntarr replacement):
   hunt [run|status|missing|config]  Rate-limited missing-item searches
 
+AUTOBRR (IRC announce parser, preinstall):
+  autobrr [status|filters|irc|clients|releases]  Read-only introspection
+
 DOWNLOADS:
   downloads [list|active|pause|resume|remove]
   queue                    Sonarr/Radarr download queues
@@ -2555,6 +2694,7 @@ case "$cmd" in
     ebooks|ebook)     cmd_ebooks "$@" ;;
     music|artists)    cmd_music "$@" ;;
     comics|comic)     cmd_comics "$@" ;;
+    autobrr)          cmd_autobrr "$@" ;;
     hunt)             cmd_hunt "$@" ;;
     downloads|dl)     cmd_downloads "$@" ;;
     queue)            cmd_queue "$@" ;;

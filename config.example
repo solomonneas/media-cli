@@ -69,12 +69,19 @@ TDARR_URL="http://localhost:8265"
 # Mylar3 (comics). Port 8090. ComicVine-backed metadata. Not servarr-shaped:
 # auth is a ?apikey= query param, not an X-Api-Key header. COMICVINE_API_KEY
 # is set inside Mylar3's own config.ini (comicvine_api = ...) rather than
-# consumed directly by this CLI — it lives here only as a reference so the
+# consumed directly by this CLI - it lives here only as a reference so the
 # key is discoverable during setup.
 # MYLAR_URL="http://localhost:8090"
 # MYLAR_KEY=""
 # DEFAULT_COMIC_ROOT="H:\\Comics"
 # COMICVINE_API_KEY=""
+
+# Autobrr (IRC announce parser). Port 7474. Stands up empty with zero IRC
+# networks; the baseline is "0 releases seen" until a private-tracker invite
+# arrives and an IRC network is added via the web UI. Writes (filters, IRC
+# credentials) stay in the web UI; this CLI is read-only.
+# AUTOBRR_URL="http://localhost:7474"
+# AUTOBRR_KEY=""
 
 # Hunt (Huntarr replacement). Fires targeted missing-item search commands
 # on a rate-limited cadence. Huntarr upstream was taken down 2026-02 over

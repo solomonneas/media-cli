@@ -447,6 +447,16 @@ print(cv if cv == 'installed' else cv[:8])
         abv=$(_autobrr "config" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin)[\"version\"]}')" 2>/dev/null) && \
             echo "✅ Autobrr   $abv" || echo "❌ Autobrr   DOWN"
     fi
+    if [ -n "${CROSSSEED_KEY:-}" ]; then
+        # /api/ping is unauthenticated and returns the literal string "OK".
+        local cspong
+        cspong=$(_curl "${CROSSSEED_URL:-http://localhost:2468}/api/ping" "") || cspong=""
+        if [ "$cspong" = "OK" ]; then
+            echo "✅ Cross-seed reachable"
+        else
+            echo "❌ Cross-seed DOWN"
+        fi
+    fi
 
     echo ""
     echo "=== Library ==="
@@ -1300,6 +1310,225 @@ EOF
         *)
             echo "Unknown autobrr subcommand: $subcmd"
             echo "Run 'media autobrr help' for usage."
+            return 1
+            ;;
+    esac
+}
+
+### Cross-seed ###
+# Webhook-driven daemon that matches existing torrents against other trackers
+# via Prowlarr-managed Torznab indexers. v6 surfaces a small REST API:
+#   GET  /api/ping          - liveness (returns "OK", no auth)
+#   POST /api/webhook       - manual search by infoHash or path
+#   POST /api/announce      - real-time announce processing (used by Autobrr)
+#   POST /api/job           - trigger one of: search, rss, inject, cleanup,
+#                              updateIndexerCaps
+# There is no /api/stats or /api/recent in v6; "what has cross-seed seen
+# lately" is answered by tailing the daily info log instead.
+
+# Default location of cross-seed's info log on Windows (the canonical install
+# uses APPDATA\Local). CROSSSEED_LOGDIR overrides for SSH/remote layouts.
+# Note: log/config/outputDir lookups are LOCAL ONLY at the moment - on
+# MEDIA_HOST=ssh:* we'd need to route through _powershell. The HTTP API
+# (status/search/rss/inject/cleanup jobs) works against any reachable
+# CROSSSEED_URL regardless of MEDIA_HOST.
+_crossseed_logfile() {
+    local dir="${CROSSSEED_LOGDIR:-${LOCALAPPDATA:-C:/Users/$USER/AppData/Local}/cross-seed/logs}"
+    echo "${dir}/info.current.log"
+}
+
+# Detect filesystem-bound subcommand on a remote MEDIA_HOST. Returns 0 when
+# the call should bail out with a clear message instead of silently reading
+# the local FS (regression Codex flagged).
+_crossseed_remote_fs_blocked() {
+    case "${MEDIA_HOST:-local}" in
+        ssh:*) echo "❌ This subcommand reads local cross-seed log/config files; not supported with MEDIA_HOST=ssh:*."
+               echo "   The HTTP API subcommands (search, rss, inject, cleanup) work against any reachable CROSSSEED_URL."
+               return 0 ;;
+    esac
+    return 1
+}
+
+# Strip ANSI escape sequences and other control chars so daemon-derived
+# strings (log lines, error responses containing tracker names) cannot
+# inject terminal escapes when echoed.
+_strip_ctrl() {
+    sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\r//g'
+}
+
+# POST a job to /api/job. Returns curl exit; caller checks status text.
+_crossseed_job() {
+    local name="$1"
+    local key="${CROSSSEED_KEY:-}"
+    local url="${CROSSSEED_URL:-http://localhost:2468}"
+    [ -z "$key" ] && { echo "❌ CROSSSEED_KEY not set"; return 1; }
+    _curl_post "${url}/api/job" "{\"name\":\"${name}\"}" "$key"
+}
+
+cmd_crossseed() {
+    local subcmd="${1:-status}"; shift 2>/dev/null || true
+    local url="${CROSSSEED_URL:-http://localhost:2468}"
+    local key="${CROSSSEED_KEY:-}"
+
+    case "$subcmd" in
+        status)
+            # /api/ping is unauthenticated; lets us distinguish daemon-down
+            # from key-misconfigured.
+            local ping; ping=$(_curl "${url}/api/ping" "") || ping=""
+            if [ "$ping" = "OK" ]; then
+                echo "✅ Daemon reachable at $url"
+            else
+                echo "❌ Daemon not reachable at $url"
+                echo "   (cross-seed scheduled task may be stopped; check 'schtasks /query /tn cross-seed')"
+                return 1
+            fi
+            if _crossseed_remote_fs_blocked; then return 0; fi
+            local logfile; logfile=$(_crossseed_logfile)
+            if [ -f "$logfile" ]; then
+                # Crude but effective: count INJECTED/SAVED markers, and
+                # surface the most recent scheduler/RSS/search timestamps.
+                # Output is piped through _strip_ctrl in case a tracker name
+                # in a logged line contains escape sequences.
+                LOGFILE="$logfile" python3 -c "
+import os, re
+path = os.environ['LOGFILE']
+try:
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        lines = f.readlines()
+except OSError:
+    print('  (log not readable)'); raise SystemExit
+def last(rx):
+    pat = re.compile(rx)
+    for ln in reversed(lines):
+        m = pat.search(ln)
+        if m: return ln.strip()
+    return None
+saved    = sum(1 for ln in lines if 'cross-seed found ' in ln or ' SAVED ' in ln or ' saved ' in ln.lower())
+injected = sum(1 for ln in lines if ' INJECTED ' in ln or ' injected ' in ln.lower())
+errors   = sum(1 for ln in lines if ' error: ' in ln)
+last_rss = last(r'rss scan complete')
+last_srch= last(r'\\[search\\] .*complete')
+print(f'Today\\'s log: {os.path.basename(path)}')
+print(f'  matches saved/injected (heuristic): saved~{saved} injected~{injected}')
+print(f'  errors logged: {errors}')
+if last_rss:    print(f'  last RSS:    {last_rss}')
+if last_srch:   print(f'  last search: {last_srch}')
+" | _strip_ctrl
+            else
+                echo "  (info log not found at $logfile)"
+            fi
+            # outputDir count for action: save first-run mode
+            local outdir="${LOCALAPPDATA:-C:/Users/$USER/AppData/Local}/cross-seed/cross-seeds"
+            if [ -d "$outdir" ]; then
+                local n; n=$(find "$outdir" -name '*.torrent' 2>/dev/null | wc -l | tr -d ' ')
+                echo "  saved .torrent files in outputDir: $n"
+            fi
+            ;;
+
+        log|tail)
+            if _crossseed_remote_fs_blocked; then return 0; fi
+            local n="${1:-30}"
+            local logfile; logfile=$(_crossseed_logfile)
+            if [ -f "$logfile" ]; then
+                tail -n "$n" "$logfile" | _strip_ctrl
+            else
+                echo "❌ Log not found: $logfile"
+                return 1
+            fi
+            ;;
+
+        search)
+            # Force a search-job sweep across the configured client torrents.
+            # Subject to delay/searchLimit/excludeRecentSearch in config.js.
+            local resp; resp=$(_crossseed_job search 2>&1 | _strip_ctrl) || true
+            if [ -z "$resp" ] || [ "$resp" = "OK" ]; then
+                echo "✅ Search job triggered (watch 'media crossseed log')"
+            else
+                echo "Response: $resp"
+            fi
+            ;;
+
+        rss)
+            local resp; resp=$(_crossseed_job rss 2>&1 | _strip_ctrl) || true
+            if [ -z "$resp" ] || [ "$resp" = "OK" ]; then
+                echo "✅ RSS job triggered (watch 'media crossseed log')"
+            else
+                echo "Response: $resp"
+            fi
+            ;;
+
+        inject)
+            # Process saved .torrent files in outputDir (action: save mode).
+            # Required when first-run is "save"; harmless in "inject" mode.
+            local resp; resp=$(_crossseed_job inject 2>&1 | _strip_ctrl) || true
+            if [ -z "$resp" ] || [ "$resp" = "OK" ]; then
+                echo "✅ Inject job triggered (saved .torrent files will be processed)"
+            else
+                echo "Response: $resp"
+            fi
+            ;;
+
+        cleanup)
+            local resp; resp=$(_crossseed_job cleanup 2>&1 | _strip_ctrl) || true
+            if [ -z "$resp" ] || [ "$resp" = "OK" ]; then
+                echo "✅ Cleanup job triggered"
+            else
+                echo "Response: $resp"
+            fi
+            ;;
+
+        config)
+            if _crossseed_remote_fs_blocked; then return 0; fi
+            # Show key fields from the user's config.js. Reading raw JS so
+            # we don't depend on Node being on PATH for the CLI.
+            local cfg="${CROSSSEED_CONFIG:-${LOCALAPPDATA:-C:/Users/$USER/AppData/Local}/cross-seed/config.js}"
+            if [ ! -f "$cfg" ]; then
+                echo "❌ Config not found: $cfg"
+                return 1
+            fi
+            echo "Config: $cfg"
+            # `|| true` keeps set -e from killing the CLI when the user's
+            # config.js is missing one of the keys we look for.
+            grep -E "^\s*(action|matchMode|delay|host|port|searchCadence|rssCadence|searchLimit):" "$cfg" 2>/dev/null \
+                | sed -E 's/^\s+//; s/,\s*$//; s/^/  /' || true
+            # Count only quoted-URL lines that look like torznab entries.
+            # Matches lines like: "http://host:port/path?apikey=..."
+            # `grep -c` prints "0" AND exits 1 on zero matches, so plain
+            # `... || echo 0` would emit "0\n0". Split the assignment so the
+            # fallback runs only when grep itself failed.
+            local tn
+            tn=$(grep -cE '^\s*"https?://[^"]+apikey=[^"]+"' "$cfg" 2>/dev/null) || tn=0
+            echo "  torznab feeds: $tn"
+            ;;
+
+        help|--help|-h)
+            cat <<'EOF'
+Usage: media crossseed <subcommand>
+
+  status                   Daemon ping, log-derived match counts, outputDir size
+  log [N]                  Tail N lines of today's info log (default 30)
+  search                   Force an immediate search-job sweep
+  rss                      Force an immediate RSS scan
+  inject                   Process saved .torrent files (action: save first-run)
+  cleanup                  Run housekeeping job
+  config                   Print key config.js fields + torznab feed count
+
+Action modes (config.js):
+  action: "save"           First-run mode. Writes .torrent files to outputDir
+                           for review. Must run 'inject' to add them to qBit.
+  action: "inject"         Daemon adds matches to qBit directly (production).
+
+Config:
+  CROSSSEED_URL            Default: http://localhost:2468
+  CROSSSEED_KEY            Autogenerated; get with 'cross-seed api-key'
+  CROSSSEED_LOGDIR         Override log directory (default Windows: APPDATA\\Local)
+  CROSSSEED_CONFIG         Override config.js path
+EOF
+            ;;
+
+        *)
+            echo "Unknown crossseed subcommand: $subcmd"
+            echo "Run 'media crossseed help' for usage."
             return 1
             ;;
     esac
@@ -2885,6 +3114,7 @@ case "$cmd" in
     music|artists)    cmd_music "$@" ;;
     comics|comic)     cmd_comics "$@" ;;
     autobrr)          cmd_autobrr "$@" ;;
+    crossseed|xseed)  cmd_crossseed "$@" ;;
     hunt)             cmd_hunt "$@" ;;
     downloads|dl)     cmd_downloads "$@" ;;
     queue)            cmd_queue "$@" ;;

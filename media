@@ -413,6 +413,40 @@ cmd_status() {
         fv=$(_flaresolverr_get | python3 -c "import sys,json; print(f'v{json.load(sys.stdin).get(\"version\",\"?\")}')" 2>/dev/null) && \
             echo "✅ FlareSolvr $fv" || echo "❌ FlareSolvr DOWN"
     fi
+    if [ -n "${READARR_KEY:-}" ]; then
+        local rav
+        rav=$(_readarr_api "${READARR_URL}" "${READARR_KEY}" "system/status" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin)[\"version\"]}')" 2>/dev/null) && \
+            echo "✅ Readarr-A $rav" || echo "❌ Readarr-A DOWN"
+    fi
+    if [ -n "${READARR_EBOOKS_KEY:-}" ]; then
+        local rev
+        rev=$(_readarr_api "${READARR_EBOOKS_URL}" "${READARR_EBOOKS_KEY}" "system/status" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin)[\"version\"]}')" 2>/dev/null) && \
+            echo "✅ Readarr-E $rev" || echo "❌ Readarr-E DOWN"
+    fi
+    if [ -n "${LIDARR_KEY:-}" ]; then
+        local liv
+        liv=$(_lidarr "system/status" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin)[\"version\"]}')" 2>/dev/null) && \
+            echo "✅ Lidarr    $liv" || echo "❌ Lidarr    DOWN"
+    fi
+    if [ -n "${MYLAR_KEY:-}" ]; then
+        # Mylar3 uses query-param auth; getVersion returns {success, data:{current_version,...}}.
+        # current_version may legitimately be null right after install before the git_path check runs.
+        local myv
+        myv=$(_mylar "getVersion" | python3 -c "
+import sys, json
+try: r = json.load(sys.stdin)
+except json.JSONDecodeError: sys.exit(1)
+if not r.get('success'): sys.exit(1)
+cv = r.get('data',{}).get('current_version') or 'installed'
+print(cv if cv == 'installed' else cv[:8])
+" 2>/dev/null) && \
+            echo "✅ Mylar3    $myv" || echo "❌ Mylar3    DOWN"
+    fi
+    if [ -n "${AUTOBRR_KEY:-}" ]; then
+        local abv
+        abv=$(_autobrr "config" | python3 -c "import sys,json; print(f'v{json.load(sys.stdin)[\"version\"]}')" 2>/dev/null) && \
+            echo "✅ Autobrr   $abv" || echo "❌ Autobrr   DOWN"
+    fi
 
     echo ""
     echo "=== Library ==="
@@ -420,6 +454,67 @@ cmd_status() {
     mc=$(_radarr "movie" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null) || mc="?"
     sc=$(_sonarr "series" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null) || sc="?"
     echo "  Movies: $mc  |  Shows: $sc"
+    if [ -n "${LIDARR_KEY:-}" ]; then
+        local ac
+        ac=$(_lidarr "artist" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null) || ac="?"
+        echo "  Artists: $ac"
+    fi
+    if [ -n "${READARR_EBOOKS_KEY:-}" ] || [ -n "${READARR_KEY:-}" ]; then
+        local abc ebc
+        if [ -n "${READARR_KEY:-}" ]; then
+            abc=$(_readarr_api "${READARR_URL}" "${READARR_KEY}" "author" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null) || abc="?"
+        fi
+        if [ -n "${READARR_EBOOKS_KEY:-}" ]; then
+            ebc=$(_readarr_api "${READARR_EBOOKS_URL}" "${READARR_EBOOKS_KEY}" "author" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null) || ebc="?"
+        fi
+        echo "  Authors: audiobooks=${abc:--} ebooks=${ebc:--}"
+    fi
+    if [ -n "${MYLAR_KEY:-}" ]; then
+        local cc
+        cc=$(_mylar "getIndex" | python3 -c "
+import sys, json
+try: r = json.load(sys.stdin)
+except json.JSONDecodeError: print('?'); sys.exit(0)
+print(len(r.get('data') or []))
+" 2>/dev/null) || cc="?"
+        echo "  Comics: $cc"
+    fi
+
+    # Hunt cycle: read cached state file, no live API. Shows when the
+    # hourly HuntCycle last fired and per-app cumulative counts.
+    local hunt_state_file="${HUNT_STATE_FILE:-C:/ProgramData/arr-cli/hunt-state.json}"
+    if [ -f "$hunt_state_file" ]; then
+        echo ""
+        echo "=== Hunt ==="
+        HUNT_STATE_FILE="$hunt_state_file" python3 -c "
+import os, json, datetime
+def fmt(ts):
+    # last_run values are unix epoch ints from time.time(); humanize them.
+    try: return datetime.datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M:%S')
+    except (TypeError, ValueError, OSError): return str(ts)
+try:
+    with open(os.environ['HUNT_STATE_FILE'], 'r', encoding='utf-8') as f:
+        state = json.load(f)
+except (OSError, json.JSONDecodeError):
+    print('  (no readable hunt-state.json)')
+    raise SystemExit
+last_run  = state.get('last_run', {})
+total     = state.get('total', {})
+last_cnt  = state.get('last_count', {})
+numeric_ts = [v for v in last_run.values() if isinstance(v,(int,float))]
+if numeric_ts:
+    print(f'  Latest cycle: {fmt(max(numeric_ts))}')
+else:
+    print('  (no cycles recorded)')
+apps = sorted(set(list(last_run.keys()) + list(total.keys())))
+for app in apps:
+    t = total.get(app, 0)
+    lc = last_cnt.get(app, 0)
+    lr = last_run.get(app)
+    when = fmt(lr) if lr is not None else '?'
+    print(f'    {app:<12}  total={t:<6} last={lc} @ {when}')
+" 2>/dev/null || echo "  (hunt-state unreadable)"
+    fi
 
     echo ""
     echo "=== Active Downloads ==="

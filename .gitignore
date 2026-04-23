@@ -4,4 +4,8 @@ config
 *~
 .DS_Store
 .claude/
+.codex/
 ROADMAP.md
+
+# Local learnings (never commit)
+.learnings/
